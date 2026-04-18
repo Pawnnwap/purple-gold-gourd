@@ -1,0 +1,2 @@
+# Install the local package with the core dependency set from pyproject.toml
+-e .

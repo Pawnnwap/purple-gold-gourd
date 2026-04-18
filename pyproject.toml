@@ -1,0 +1,72 @@
+[project]
+name = "purple-gold-gourd"
+version = "0.1.1"
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [
+  { name = "Pawnnwap" },
+]
+license = "MIT"
+keywords = [
+  "bilibili",
+  "chat",
+  "persona",
+  "rag",
+  "speech",
+  "transcription",
+  "tts",
+  "youtube",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+description = "Purple-Gold Gourd (紫金葫芦): absorb a creator's public voice and refine it into a chat persona."
+requires-python = ">=3.11"
+dependencies = [
+  "ddgs>=9.13.0",
+  "openai>=1.30.0",
+  "requests>=2.31.0",
+  "yt-dlp>=2025.1.0",
+]
+
+[project.optional-dependencies]
+bilibili = [
+  "playwright>=1.45.0",
+]
+speech = [
+  "funasr>=1.1.0",
+]
+tts = [
+  "numpy>=1.26.0",
+  "qwen-tts>=0.1.0",
+  "sounddevice>=0.4.6",
+  "soundfile>=0.12.1",
+]
+full = [
+  "playwright>=1.45.0",
+  "funasr>=1.1.0",
+  "numpy>=1.26.0",
+  "qwen-tts>=0.1.0",
+  "sounddevice>=0.4.6",
+  "soundfile>=0.12.1",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["purple_gold_gourd*"]
+
+[project.scripts]
+purple-gold-gourd = "purple_gold_gourd.cli:main"
+zijin-hulu = "purple_gold_gourd.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

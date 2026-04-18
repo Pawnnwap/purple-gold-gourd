@@ -1,0 +1,2 @@
+# Install the local package with the full optional dependency set from pyproject.toml
+-e .[full]

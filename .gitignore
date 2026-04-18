@@ -1,0 +1,50 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors and local tooling
+.vscode/
+.idea/
+.archive/
+.opencode/
+.opencodeignore
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Generated project data
+data/
+tmp_downloads/
+tmp_downloads2/
+tmp_downloads3/
+tmp_*.py
+tmp_*.wav
+tmp_*.json
+tmp_*.txt
+
+# Logs and OS clutter
+*.log
+Thumbs.db
+.DS_Store
+token
