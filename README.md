@@ -1,5 +1,7 @@
 # 紫金葫芦
 
+[中文](./README.zh.md) | English
+
 [![PyPI](https://img.shields.io/pypi/v/purple-gold-gourd)](https://pypi.org/project/purple-gold-gourd/)
 [![Python](https://img.shields.io/pypi/pyversions/purple-gold-gourd)](https://pypi.org/project/purple-gold-gourd/)
 
