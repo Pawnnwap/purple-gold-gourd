@@ -56,12 +56,16 @@ class MediaDownloader:
         page_count = max(math.ceil(max(scan_limit, 1) / page_size), 1)
         for order in ("click", "pubdate"):
             for page in range(1, page_count + 1):
-                for item in self._fetch_bilibili_vlist(
-                    creator.creator_id,
-                    order=order,
-                    page=page,
-                    page_size=page_size,
-                ):
+                try:
+                    items = self._fetch_bilibili_vlist(
+                        creator.creator_id,
+                        order=order,
+                        page=page,
+                        page_size=page_size,
+                    )
+                except Exception:
+                    continue
+                for item in items:
                     video = self._video_from_bilibili_arc(item, creator)
                     if not video.video_id:
                         continue
@@ -69,7 +73,39 @@ class MediaDownloader:
                     if existing is None or video.hotness > existing.hotness:
                         seen[video.video_id] = video
         videos = list(seen.values())
+        if not videos:
+            videos = self._rank_bilibili_videos_ytdlp(creator, scan_limit)
         videos.sort(key=lambda item: item.hotness, reverse=True)
+        return videos
+
+    def _rank_bilibili_videos_ytdlp(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+        try:
+            entries = self._list_entries(creator.video_tab_url, "bilibili", scan_limit)
+        except Exception:
+            return []
+        videos: list[VideoInfo] = []
+        seen: set[str] = set()
+        for entry in entries:
+            video_id = str(entry.get("id") or "")
+            if not video_id or video_id in seen:
+                continue
+            seen.add(video_id)
+            url = self._entry_url(entry, "bilibili")
+            if not url:
+                continue
+            published = parse_upload_datetime(timestamp=entry.get("timestamp"))
+            view_count = int(entry.get("view_count") or 0)
+            videos.append(VideoInfo(
+                platform="bilibili",
+                video_id=video_id,
+                title=str(entry.get("title") or video_id),
+                url=url,
+                uploader=creator.name,
+                duration_sec=int(entry.get("duration") or 0),
+                published_at=published.astimezone(UTC).isoformat() if published else "",
+                view_count=view_count,
+                hotness=hotness_score(views=view_count, published_at=published),
+            ))
         return videos
 
     def download_audio(self, video: VideoInfo, output_dir: Path) -> Path:
@@ -254,13 +290,42 @@ class MediaDownloader:
             **self._bili_dm_params,
         }
         payload = self._request_bilibili_arc_search(params)
+
         if (payload.get("code") or 0) != 0:
-            self._seed_bilibili_browser_session(mid)
-            params.update(self._bili_dm_params)
-            payload = self._request_bilibili_arc_search(params)
+            payload = self._fetch_bilibili_vlist_unsigned(mid, order, page, page_size)
+
+        if (payload.get("code") or 0) != 0:
+            try:
+                self._seed_bilibili_browser_session(mid)
+                params.update(self._bili_dm_params)
+                payload = self._request_bilibili_arc_search(params)
+            except Exception:
+                pass
+
         data = payload.get("data") or {}
         listing = data.get("list") or {}
         return listing.get("vlist") or []
+
+    def _fetch_bilibili_vlist_unsigned(self, mid: str, order: str, page: int, page_size: int) -> dict[str, object]:
+        params = {
+            "mid": mid,
+            "pn": page,
+            "ps": page_size,
+            "order": order,
+            "tid": 0,
+            "keyword": "",
+            "jsonp": "jsonp",
+        }
+        try:
+            self._resolver._prime_bilibili_cookies()
+            response = self._resolver.session.get(
+                "https://api.bilibili.com/x/space/arc/search",
+                params=params,
+                timeout=20,
+            )
+            return response.json()
+        except Exception:
+            return {"code": -1}
 
     def _request_bilibili_arc_search(self, params: dict[str, object]) -> dict[str, object]:
         self._resolver._prime_bilibili_cookies()

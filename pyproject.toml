@@ -1,6 +1,6 @@
 [project]
 name = "purple-gold-gourd"
-version = "0.1.1"
+version = "0.1.2"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
   { name = "Pawnnwap" },
