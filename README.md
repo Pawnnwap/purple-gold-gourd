@@ -1,5 +1,8 @@
 # 紫金葫芦
 
+[![PyPI](https://img.shields.io/pypi/v/purple-gold-gourd)](https://pypi.org/project/purple-gold-gourd/)
+[![Python](https://img.shields.io/pypi/pyversions/purple-gold-gourd)](https://pypi.org/project/purple-gold-gourd/)
+
 Named after the Purple-Gold Gourd from *Journey to the West*: "Dare you answer me when I call your name?" Once a creator answers the call, this library rapidly draws in their public voice, transcribes it, distills it, and refines it into a chat persona.
 
 ## What it does

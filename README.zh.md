@@ -1,5 +1,8 @@
 # 紫金葫芦
 
+[![PyPI](https://img.shields.io/pypi/v/purple-gold-gourd)](https://pypi.org/project/purple-gold-gourd/)
+[![Python](https://img.shields.io/pypi/pyversions/purple-gold-gourd)](https://pypi.org/project/purple-gold-gourd/)
+
 一秒吸纳，顷刻炼化
 把 B 站 UP 主或 YouTube 创作者转化为以转录为基础、支持声音复刻的对话人格。
 
