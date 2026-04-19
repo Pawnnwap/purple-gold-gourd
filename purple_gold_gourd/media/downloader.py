@@ -13,6 +13,13 @@ from ..utils import USER_AGENT, ensure_dir, hotness_score, parse_upload_datetime
 from .platforms import CreatorResolver
 
 
+class _SilentLogger:
+    def debug(self, msg: str) -> None: pass
+    def info(self, msg: str) -> None: pass
+    def warning(self, msg: str) -> None: pass
+    def error(self, msg: str) -> None: pass
+
+
 class MediaDownloader:
     def __init__(self, ffmpeg_path: str) -> None:
         self.ffmpeg_path = ffmpeg_path
@@ -51,6 +58,14 @@ class MediaDownloader:
         return videos
 
     def _rank_bilibili_creator_videos(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+        # Try bilibili-api-python first — it uses a more browser-authentic HTTP stack
+        # that bypasses risk control better than plain requests + WBI signing.
+        videos = self._rank_bilibili_videos_biliapi(creator, scan_limit)
+        if videos:
+            videos.sort(key=lambda item: item.hotness, reverse=True)
+            return videos
+
+        # Fall back to our own WBI-signed API.
         seen: dict[str, VideoInfo] = {}
         page_size = min(max(scan_limit, 3), 40)
         page_count = max(math.ceil(max(scan_limit, 1) / page_size), 1)
@@ -75,14 +90,58 @@ class MediaDownloader:
         videos = list(seen.values())
         if not videos:
             videos = self._rank_bilibili_videos_ytdlp(creator, scan_limit)
+        if not videos:
+            videos = self._rank_bilibili_videos_playwright(creator, scan_limit)
         videos.sort(key=lambda item: item.hotness, reverse=True)
         return videos
 
-    def _rank_bilibili_videos_ytdlp(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+    def _rank_bilibili_videos_biliapi(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
         try:
-            entries = self._list_entries(creator.video_tab_url, "bilibili", scan_limit)
+            from bilibili_api import user as bili_user
+            import asyncio
+
+            async def _fetch():
+                u = bili_user.User(uid=int(creator.creator_id))
+                result = []
+                for order in (bili_user.VideoOrder.VIEW, bili_user.VideoOrder.PUBDATE):
+                    try:
+                        data = await u.get_videos(pn=1, ps=min(scan_limit, 30), order=order)
+                        result.extend((data.get("list") or {}).get("vlist") or [])
+                    except Exception:
+                        pass
+                return result
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        items = pool.submit(asyncio.run, _fetch()).result(timeout=60)
+                else:
+                    items = loop.run_until_complete(_fetch())
+            except Exception:
+                items = asyncio.run(_fetch())
         except Exception:
             return []
+
+        videos: list[VideoInfo] = []
+        seen: set[str] = set()
+        for item in items:
+            video = self._video_from_bilibili_arc(item, creator)
+            if video.video_id and video.video_id not in seen:
+                seen.add(video.video_id)
+                videos.append(video)
+        return videos
+
+    def _rank_bilibili_videos_ytdlp(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+        entries: list[dict[str, object]] = []
+        for browser in ("edge", "chrome", "firefox", None):
+            try:
+                entries = self._bili_ytdlp_entries(creator.video_tab_url, scan_limit, browser)
+                if entries:
+                    break
+            except Exception:
+                continue
         videos: list[VideoInfo] = []
         seen: set[str] = set()
         for entry in entries:
@@ -107,6 +166,99 @@ class MediaDownloader:
                 hotness=hotness_score(views=view_count, published_at=published),
             ))
         return videos
+
+    def _rank_bilibili_videos_playwright(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return []
+
+        try:
+            from fake_useragent import UserAgent
+            ua_str = UserAgent(browsers=["chrome", "edge"], os="windows").random
+        except Exception:
+            ua_str = USER_AGENT
+
+        target_url = f"https://space.bilibili.com/{creator.creator_id}/video"
+        executable = self._find_browser_executable()
+
+        for headless in (True, False):
+            collected: list[dict[str, object]] = []
+
+            def _on_response(response) -> None:
+                if len(collected) >= scan_limit:
+                    return
+                if "/x/space/wbi/arc/search" not in response.url and "/x/space/arc/search" not in response.url:
+                    return
+                try:
+                    data = response.json()
+                    vlist = ((data.get("data") or {}).get("list") or {}).get("vlist") or []
+                    collected.extend(vlist)
+                except Exception:
+                    pass
+
+            try:
+                with sync_playwright() as pw:
+                    launch_opts: dict[str, object] = {"headless": headless}
+                    if executable:
+                        launch_opts["executable_path"] = executable
+                    browser = pw.chromium.launch(**launch_opts)
+                    context = browser.new_context(
+                        user_agent=ua_str,
+                        locale="zh-CN",
+                        viewport={"width": 1400, "height": 900},
+                    )
+                    context.add_init_script(
+                        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                        "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3]});"
+                        "Object.defineProperty(navigator,'languages',{get:()=>['zh-CN','zh','en']});"
+                    )
+                    page = context.new_page()
+                    page.on("response", _on_response)
+                    page.goto(target_url, wait_until="networkidle", timeout=90000)
+                    page.wait_for_timeout(4000)
+                    for cookie in context.cookies():
+                        self._resolver.session.cookies.set(
+                            cookie["name"], cookie["value"],
+                            domain=cookie["domain"], path=cookie["path"],
+                        )
+                    browser.close()
+            except Exception:
+                continue
+
+            if collected:
+                break
+
+        videos: list[VideoInfo] = []
+        seen: set[str] = set()
+        for item in collected[:scan_limit]:
+            video = self._video_from_bilibili_arc(item, creator)
+            if video.video_id and video.video_id not in seen:
+                seen.add(video.video_id)
+                videos.append(video)
+        return videos
+
+    def _bili_ytdlp_entries(
+        self, url: str, scan_limit: int, browser: str | None,
+    ) -> list[dict[str, object]]:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "logger": _SilentLogger(),
+            "skip_download": True,
+            "extract_flat": True,
+            "playlistend": scan_limit,
+            "lazy_playlist": True,
+            "http_headers": {
+                "User-Agent": USER_AGENT,
+                "Referer": "https://www.bilibili.com/",
+            },
+        }
+        if browser:
+            opts["cookiesfrombrowser"] = (browser,)
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        return list(info.get("entries") or [])
 
     def download_audio(self, video: VideoInfo, output_dir: Path) -> Path:
         ensure_dir(output_dir)

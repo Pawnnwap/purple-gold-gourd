@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import json
+import random
 import re
 import warnings
 from difflib import SequenceMatcher
@@ -38,15 +40,19 @@ _BILI_DM_PARAMS = {
 }
 
 
+def _make_session() -> requests.Session:
+    try:
+        from curl_cffi.requests import Session as CurlSession
+        sess = CurlSession(impersonate="chrome131")
+    except ImportError:
+        sess = requests.Session()
+    sess.headers.update({"User-Agent": USER_AGENT, "Referer": "https://www.bilibili.com/"})
+    return sess
+
+
 class CreatorResolver:
     def __init__(self) -> None:
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": USER_AGENT,
-                "Referer": "https://www.bilibili.com/",
-            },
-        )
+        self.session = _make_session()
 
     def resolve(self, query: str, platform: str = "auto") -> CreatorRef:
         query = query.strip()
@@ -248,7 +254,38 @@ class CreatorResolver:
         )
 
     def _prime_bilibili_cookies(self) -> None:
-        self.session.get("https://www.bilibili.com", timeout=20)
+        import time
+        if "buvid3" in self.session.cookies:
+            return
+        try:
+            spi = self.session.get(
+                "https://api.bilibili.com/x/frontend/finger/spi", timeout=10,
+            ).json().get("data") or {}
+            buvid3 = str(spi.get("b_3") or "")
+            buvid4 = str(spi.get("b_4") or "")
+            if buvid3:
+                self.session.cookies.set("buvid3", buvid3, domain=".bilibili.com")
+            if buvid4:
+                self.session.cookies.set("buvid4", buvid4, domain=".bilibili.com")
+        except Exception:
+            pass
+        try:
+            ts = int(time.time())
+            hexsign = hmac.new(b"XgwSnGZ1p", f"ts{ts}".encode(), "sha256").hexdigest()
+            ticket_resp = self.session.post(
+                "https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket",
+                params={"key_id": "ec02", "hexsign": hexsign, "context[ts]": ts, "csrf": ""},
+                timeout=10,
+            ).json()
+            ticket = (ticket_resp.get("data") or {}).get("ticket") or ""
+            if ticket:
+                self.session.cookies.set("bili_ticket", ticket, domain=".bilibili.com")
+        except Exception:
+            pass
+        try:
+            self.session.get("https://www.bilibili.com", timeout=15)
+        except Exception:
+            pass
 
     def _fetch_bilibili_card(self, mid: str) -> dict[str, object]:
         response = self.session.get(
@@ -273,11 +310,17 @@ class CreatorResolver:
         return img_key, sub_key
 
     def _sign_wbi(self, params: dict[str, object]) -> dict[str, object]:
+        import random
         import time
 
         img_key, sub_key = self._resolve_nav_wbi_keys()
         mixin = "".join((img_key + sub_key)[index] for index in _MIXIN_KEY_ENC_TAB)[:32]
+        dm_rand = "ABCDEFGHIJK"
         signed = dict(params)
+        signed.setdefault("dm_img_list", "[]")
+        signed.setdefault("dm_img_str", "".join(random.sample(dm_rand, 2)))
+        signed.setdefault("dm_cover_img_str", "".join(random.sample(dm_rand, 2)))
+        signed.setdefault("dm_img_inter", '{"ds":[],"wh":[0,0,0],"of":[0,0,0]}')
         signed["wts"] = int(time.time())
         signed = {key: re.sub(r"[!'()*]", "", str(value)) for key, value in signed.items()}
         query = urlencode(sorted(signed.items()))
