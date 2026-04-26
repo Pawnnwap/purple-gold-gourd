@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from purple_gold_gourd.chat.discussion import _with_brevity_prompt
 from purple_gold_gourd.chat.persona import (
     _BACKGROUND_INFO_TITLE,
     _CUSTOM_DOCUMENTS_TITLE,
@@ -103,8 +104,10 @@ class SkillPromptTests(unittest.TestCase):
 class PersonaPromptTests(unittest.TestCase):
     def test_persona_section_titles_stay_in_sync(self) -> None:
         chat = object.__new__(PersonaChat)
+        chat.config = type("Config", (), {"brevity": False})()
         chat.skill_text = "name: sample"
         chat.language = "en"
+        chat.manifest = type("Manifest", (), {"creator": type("Creator", (), {"name": "Alice"})()})()
 
         system_prompt = chat._system_prompt()
         self.assertIn(_PUBLIC_REMARKS_TITLE, system_prompt)
@@ -160,6 +163,16 @@ class PersonaPromptTests(unittest.TestCase):
         self.assertIn(_CUSTOM_DOCUMENTS_TITLE, user_prompt)
         self.assertIn(_BACKGROUND_INFO_TITLE, user_prompt)
         self.assertNotIn("Source rules:", user_prompt)
+
+    def test_brevity_flag_adds_system_prompt_suffix(self) -> None:
+        chat = object.__new__(PersonaChat)
+        chat.config = type("Config", (), {"brevity": True})()
+        chat.skill_text = "name: sample"
+        chat.language = "en"
+        chat.manifest = type("Manifest", (), {"creator": type("Creator", (), {"name": "Alice"})()})()
+
+        self.assertIn("Be brief.", chat._system_prompt())
+        self.assertIn("保持简洁。", _with_brevity_prompt("主持人提示", True, "zh"))
 
 
 if __name__ == "__main__":

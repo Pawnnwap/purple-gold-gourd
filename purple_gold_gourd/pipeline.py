@@ -41,10 +41,13 @@ class BuildPipeline:
         top_n: int = 10,
         scan_limit: int = 30,
         series_numbers: list[int] | None = None,
+        include_title_keywords: list[str] | None = None,
+        limit_to_target_videos: bool = False,
         local_media_paths: list[str | Path] | None = None,
         rebuild: bool = False,
     ) -> ProfileManifest:
         selected_series_numbers = self._normalize_series_numbers(series_numbers)
+        title_keywords = self._normalize_title_keywords(include_title_keywords)
         normalized_local_media_paths = self._normalize_local_media_paths(local_media_paths)
         if not rebuild:
             matched = self._match_cached(query, platform)
@@ -54,6 +57,8 @@ class BuildPipeline:
                     top_n=top_n,
                     scan_limit=scan_limit,
                     series_numbers=selected_series_numbers,
+                    include_title_keywords=title_keywords,
+                    limit_to_target_videos=limit_to_target_videos,
                     local_media_paths=normalized_local_media_paths,
                     rebuild=False,
                 )
@@ -69,6 +74,8 @@ class BuildPipeline:
                 top_n=top_n,
                 scan_limit=scan_limit,
                 series_numbers=selected_series_numbers,
+                include_title_keywords=title_keywords,
+                limit_to_target_videos=limit_to_target_videos,
                 local_media_paths=normalized_local_media_paths,
                 rebuild=False,
             )
@@ -88,11 +95,13 @@ class BuildPipeline:
             top_n=top_n,
             scan_limit=scan_limit,
             series_numbers=selected_series_numbers,
+            include_title_keywords=title_keywords,
         )
         return self._materialize_profile(
             manifest=manifest,
             target_videos=videos,
             local_media_paths=normalized_local_media_paths,
+            limit_to_target_videos=limit_to_target_videos,
             rebuild=rebuild,
         )
 
@@ -113,10 +122,15 @@ class BuildPipeline:
                 continue
             creator_data = data.get("creator") or {}
             name = str(creator_data.get("name") or "").lower()
+            creator_slug = str(data.get("creator_slug") or creator_dir.name).lower()
+            creator_id = str(creator_data.get("creator_id") or "").lower()
+            creator_query = str(creator_data.get("query") or "").lower()
+            homepage_url = str(creator_data.get("homepage_url") or "").lower()
             creator_platform = str(creator_data.get("platform") or "")
             if platform != "auto" and creator_platform != platform:
                 continue
-            if needle in name:
+            candidates = [name, creator_slug, creator_id, creator_query, homepage_url, creator_dir.name.lower()]
+            if any(needle == item or needle in item for item in candidates if item):
                 matches.append((manifest_path, str(creator_data.get("name") or creator_dir.name)))
         if len(matches) == 1:
             return matches[0][0]
@@ -134,6 +148,8 @@ class BuildPipeline:
         top_n: int,
         scan_limit: int,
         series_numbers: list[int],
+        include_title_keywords: list[str],
+        limit_to_target_videos: bool,
         local_media_paths: list[Path],
         rebuild: bool,
     ) -> ProfileManifest:
@@ -144,12 +160,14 @@ class BuildPipeline:
             top_n=top_n,
             scan_limit=scan_limit,
             series_numbers=target_series_numbers,
+            include_title_keywords=include_title_keywords,
         )
         refreshed = replace(existing, selected_series_numbers=target_series_numbers)
         return self._materialize_profile(
             manifest=refreshed,
             target_videos=target_videos,
             local_media_paths=local_media_paths,
+            limit_to_target_videos=limit_to_target_videos,
             rebuild=rebuild,
         )
 
@@ -221,6 +239,22 @@ class BuildPipeline:
             normalized.append(value)
         return normalized
 
+    def _normalize_title_keywords(self, keywords: list[str] | None) -> list[str]:
+        if not keywords:
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in keywords:
+            text = str(raw).strip()
+            if not text:
+                continue
+            folded = text.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            normalized.append(text)
+        return normalized
+
     def _normalize_local_media_paths(self, local_media_paths: list[str | Path] | None) -> list[Path]:
         if not local_media_paths:
             return []
@@ -240,23 +274,79 @@ class BuildPipeline:
         top_n: int,
         scan_limit: int,
         series_numbers: list[int],
+        include_title_keywords: list[str] | None = None,
     ) -> list:
-        if series_numbers:
-            return self._select_target_videos(
+        include_title_keywords = include_title_keywords or []
+        cache_path = self._target_videos_cache_path(manifest, top_n, scan_limit, series_numbers, include_title_keywords)
+        try:
+            if series_numbers:
+                videos = self._select_target_videos(
+                    creator=manifest.creator,
+                    top_n=top_n,
+                    scan_limit=scan_limit,
+                    series_numbers=series_numbers,
+                    include_title_keywords=include_title_keywords,
+                )
+                self._write_target_videos_cache(cache_path, videos)
+                return videos
+
+            cached_videos = self._cached_videos_for_creator(manifest)
+            if cached_videos and len(cached_videos) >= top_n:
+                videos = cached_videos[:top_n]
+                self._write_target_videos_cache(cache_path, videos)
+                return videos
+
+            videos = self._select_target_videos(
                 creator=manifest.creator,
                 top_n=top_n,
                 scan_limit=scan_limit,
-                series_numbers=series_numbers,
+                series_numbers=[],
+                include_title_keywords=include_title_keywords,
             )
-        cached_videos = self._cached_videos_for_creator(manifest)
-        if cached_videos:
-            return cached_videos
-        return self._select_target_videos(
-            creator=manifest.creator,
-            top_n=top_n,
-            scan_limit=scan_limit,
-            series_numbers=[],
-        )
+            self._write_target_videos_cache(cache_path, videos)
+            return videos
+        except Exception:
+            cached_targets = self._read_target_videos_cache(cache_path)
+            expected_count = len(series_numbers) if series_numbers else top_n
+            if len(cached_targets) >= expected_count:
+                return cached_targets
+            raise
+
+    def _target_videos_cache_path(
+        self,
+        manifest: ProfileManifest,
+        top_n: int,
+        scan_limit: int,
+        series_numbers: list[int],
+        include_title_keywords: list[str],
+    ) -> Path:
+        key = sha256_text(
+            "\n".join(
+                [
+                    f"top={top_n}",
+                    f"scan={scan_limit}",
+                    "series=" + ",".join(str(item) for item in series_numbers),
+                    "keywords=" + "\0".join(include_title_keywords),
+                ],
+            ),
+        )[:16]
+        return Path(manifest.creator_dir) / "targets" / f"{key}.json"
+
+    def _read_target_videos_cache(self, path: Path) -> list[VideoInfo]:
+        data = read_json(path, default=[])
+        if not isinstance(data, list):
+            return []
+        videos: list[VideoInfo] = []
+        for item in data:
+            try:
+                videos.append(VideoInfo.from_dict(item))
+            except Exception:
+                continue
+        return self._dedupe_video_infos(videos)
+
+    def _write_target_videos_cache(self, path: Path, videos: list[VideoInfo]) -> None:
+        ensure_dir(path.parent)
+        write_json(path, [video.to_dict() for video in self._dedupe_video_infos(videos)])
 
     def _select_target_videos(
         self,
@@ -264,19 +354,45 @@ class BuildPipeline:
         top_n: int,
         scan_limit: int,
         series_numbers: list[int],
+        include_title_keywords: list[str] | None = None,
     ) -> list:
-        required_scan_limit = max(scan_limit, max(series_numbers or [top_n, 1]))
-        ranked_videos = self.downloader.rank_creator_videos(creator, scan_limit=required_scan_limit)
-        if not ranked_videos:
+        required_count = max(series_numbers or [top_n, 1])
+        listed_videos = self.downloader.list_creator_videos(creator, scan_limit=required_count)
+        if not listed_videos:
             raise ValueError(f"No videos found for {creator.name}.")
         if not series_numbers:
-            return ranked_videos[:top_n]
-        if max(series_numbers) > len(ranked_videos):
+            return listed_videos[:top_n]
+        if max(series_numbers) > len(listed_videos):
             raise ValueError(
                 f"Requested series number {max(series_numbers)} is out of range for {creator.name}. "
-                f"Only {len(ranked_videos)} ranked videos were found.",
+                f"Only {len(listed_videos)} videos were found.",
             )
-        return [ranked_videos[number - 1] for number in series_numbers]
+        return [listed_videos[number - 1] for number in series_numbers]
+
+    def _with_title_keyword_videos(
+        self,
+        creator,
+        selected: list[VideoInfo],
+        scan_limit: int,
+        keywords: list[str],
+    ) -> list[VideoInfo]:
+        if not keywords:
+            return selected
+        result = list(selected)
+        seen = {video.video_id for video in result}
+        keyword_scan_limit = max(scan_limit, 120)
+        for keyword in keywords:
+            matches = self.downloader.find_creator_videos_by_title_keyword(
+                creator,
+                keyword,
+                scan_limit=keyword_scan_limit,
+            )
+            for video in matches:
+                if video.video_id in seen:
+                    continue
+                seen.add(video.video_id)
+                result.append(video)
+        return result
 
     def _cached_videos_for_creator(self, manifest: ProfileManifest) -> list:
         creator_dir = Path(manifest.creator_dir)
@@ -502,8 +618,10 @@ class BuildPipeline:
         manifest: ProfileManifest,
         target_videos: list,
         local_media_paths: list[Path],
+        limit_to_target_videos: bool,
         rebuild: bool,
     ) -> ProfileManifest:
+        target_videos = self._dedupe_video_infos(target_videos)
         creator_dir = Path(manifest.creator_dir)
         downloads_dir = ensure_dir(creator_dir / "downloads")
         transcripts_dir = ensure_dir(creator_dir / "transcripts")
@@ -538,7 +656,7 @@ class BuildPipeline:
             exclude_paths={Path(path) for path in explicit_local_transcript_paths},
         )
 
-        if manifest.selected_series_numbers:
+        if manifest.selected_series_numbers or limit_to_target_videos:
             transcript_paths = self._dedupe_paths(
                 remote_transcript_paths + existing_local_transcript_paths + explicit_local_transcript_paths,
             )
@@ -574,16 +692,11 @@ class BuildPipeline:
         else:
             skill_path = manifest.skill_path
 
-        should_refresh_voice = (
-            rebuild
-            or manifest.voice_sample is None
-            or not Path(manifest.voice_sample.audio_path).exists()
-            or transcript_paths != manifest.transcript_paths
-        )
-        if should_refresh_voice:
-            voice_sample = self.tts.choose_voice_sample(self.transcriber, transcripts, voice_dir)
-        else:
+        # Voice sample is set exclusively via `set-voice` CLI; never auto-selected.
+        if manifest.voice_sample and Path(manifest.voice_sample.audio_path).exists():
             voice_sample = manifest.voice_sample
+        else:
+            voice_sample = None
 
         updated = replace(
             manifest,

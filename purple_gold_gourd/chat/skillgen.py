@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from pathlib import Path
 
 from ..language import language_label, normalize_language_code
@@ -130,46 +129,54 @@ class SkillBuilder:
         if documents:
             sources.extend(documents)
         for index, transcript in enumerate(sources, start=1):
-            note = self._distill_document(transcript) if transcript.source_type == "document" else self._distill_video(transcript)
             note_path = note_dir / f"{index:02d}-{transcript.video_id}.md"
-            note_path.write_text(note, encoding="utf-8")
+            cached_note_path = self._find_cached_note(note_dir, transcript.video_id)
+            if cached_note_path is not None:
+                note = cached_note_path.read_text(encoding="utf-8")
+                if cached_note_path != note_path:
+                    note_path.write_text(note, encoding="utf-8")
+            else:
+                note = self._distill_document(transcript) if transcript.source_type == "document" else self._distill_video(transcript)
+                note_path.write_text(note, encoding="utf-8")
             notes.append(note)
         skill_markdown = self._render_skill(creator, videos, notes)
         skill_path = output_dir / "skill.md"
         skill_path.write_text(skill_markdown, encoding="utf-8")
         return skill_path
 
+    def _find_cached_note(self, note_dir: Path, source_id: str) -> Path | None:
+        expected_suffix = f"-{source_id}.md"
+        for path in sorted(note_dir.glob(f"*{expected_suffix}")):
+            if path.is_file() and path.stat().st_size > 0:
+                return path
+        return None
+
     def _distill_video(self, transcript: TranscriptFile) -> str:
         language = normalize_language_code(transcript.language)
         segments = self._video_note_segments(transcript)
-        try:
-            notes = [
-                self._complete(
-                    self._video_note_prompt(
-                        transcript=transcript,
-                        sample=segment,
-                        language=language,
-                        segment_index=index,
-                        segment_count=len(segments),
-                    ),
+        notes = [
+            self._complete(
+                self._video_note_prompt(
+                    transcript=transcript,
+                    sample=segment,
                     language=language,
-                )
-                for index, segment in enumerate(segments, start=1)
-            ]
-            if len(notes) == 1:
-                return notes[0]
-            return self._merge_video_notes(transcript, notes, language)
-        except Exception:
-            return self._fallback_video_note(transcript)
+                    segment_index=index,
+                    segment_count=len(segments),
+                ),
+                language=language,
+                max_tokens=700,
+            )
+            for index, segment in enumerate(segments, start=1)
+        ]
+        if len(notes) == 1:
+            return notes[0]
+        return self._merge_video_notes(transcript, notes, language)
 
     def _distill_document(self, document: TranscriptFile) -> str:
         language = normalize_language_code(document.language)
         sample = document.full_text[:12000]
         prompt = self._document_note_prompt(document=document, sample=sample, language=language)
-        try:
-            return self._complete(prompt, language=language)
-        except Exception:
-            return self._fallback_document_note(document)
+        return self._complete(prompt, language=language, max_tokens=700)
 
     def _document_note_prompt(self, document: TranscriptFile, sample: str, language: str) -> str:
         if language == "zh":
@@ -217,7 +224,7 @@ Document contents:
                 segment_hint = f"这是同一条公开表达的第 {segment_index}/{segment_count} 段，只总结本段直接支持的内容。\n"
             return f"""
 把这条公开表达的转录整理成可复用研究笔记，供 Nuwa 风格 skill 使用。
-把可观察证据写成“我记得自己公开说过的话”。
+把可观察证据写成“我记得自己说过的话”。
 保持第一人称记忆式表达，优先用“我记得……”或“按我的经验……”。
 不要虚构私下观点、私人经历或无证据事实。
 {segment_hint}
@@ -229,7 +236,7 @@ Document contents:
 语言：{transcript.language}
 公开来源：{transcript.video_url}
 
-我记得自己公开说过的样本：
+我记得自己说过的样本：
 {sample}
 """.strip()
         output_language = self._language_hint(language, "note")
@@ -259,7 +266,7 @@ Excerpt of things I remember saying in public:
 
     def _render_skill(self, creator: CreatorRef, videos: list[VideoInfo], notes: list[str]) -> str:
         video_list = "\n".join(f"- {video.title} | {video.url}" for video in videos)
-        joined_notes = "\n\n".join(notes)
+        joined_notes = "\n\n".join(self._compact_note_for_final(note) for note in notes)
         language = normalize_language_code(creator.language)
         prompt = self._final_skill_prompt(
             creator=creator,
@@ -267,10 +274,7 @@ Excerpt of things I remember saying in public:
             joined_notes=joined_notes,
             language=language,
         )
-        try:
-            return self._complete(prompt, language=language)
-        except Exception:
-            return self._fallback_skill(creator, videos)
+        return self._complete(prompt, language=language, max_tokens=1200)
 
     def _final_skill_prompt(
         self,
@@ -339,17 +343,8 @@ Research notes:
 
     def _video_note_segments(self, transcript: TranscriptFile) -> list[str]:
         if not transcript.chunks:
-            return [transcript.full_text[:12000]]
-        budget = self.llm.input_token_budget(reserved_prompt_tokens=1_400)
-        if budget <= 0:
-            return [self._sample_transcript(transcript)]
-        groups = chunked_by_budget(
-            items=transcript.chunks,
-            cost=lambda chunk: estimate_text_tokens(chunk.text) + 24,
-            max_budget=max(budget, 512),
-            overlap_items=1,
-        )
-        return [self._render_transcript_group(group) for group in groups]
+            return [transcript.full_text[:5000]]
+        return [self._sample_transcript(transcript, max_chunks=28, max_chars=5000)]
 
     def _render_transcript_group(self, chunks) -> str:
         return "\n".join(
@@ -376,10 +371,20 @@ Research notes:
                         group_count=len(groups),
                     ),
                     language=language,
+                    max_tokens=700,
                 )
                 for index, group in enumerate(groups, start=1)
             ]
         return pending[0]
+
+    def _compact_note_for_final(self, note: str, max_chars: int = 1600) -> str:
+        text = note.strip()
+        if len(text) <= max_chars:
+            return text
+        shortened = text[:max_chars]
+        if "\n" in shortened:
+            shortened = shortened.rsplit("\n", 1)[0]
+        return shortened.rstrip() + "\n..."
 
     def _merge_video_notes_prompt(
         self,
@@ -444,7 +449,7 @@ Segment notes:
             lines.append(line)
         return "\n".join(lines) or transcript.full_text[:max_chars]
 
-    def _complete(self, prompt: str, language: str = "") -> str:
+    def _complete(self, prompt: str, language: str = "", max_tokens: int | None = None) -> str:
         system_prompt = _RESEARCH_SYSTEM_PROMPTS["zh" if normalize_language_code(language) == "zh" else "en"]
         content, resolved_model = self.llm.complete(
             messages=[
@@ -455,6 +460,7 @@ Segment notes:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
+            max_tokens=max_tokens,
         )
         self.llm.preferred_model = resolved_model
         return content.strip()
@@ -467,7 +473,7 @@ Segment notes:
 - 我记得自己在《{transcript.video_title}》里公开谈过这些内容。
 
 ## 心智模型
-- 先回想我公开说过的话，再做归纳。
+- 先回想我说过的话，再做归纳。
 
 ## 判断启发
 - 如果材料里有具体案例和政策后果，优先保留这些内容。
@@ -550,13 +556,13 @@ description: 我是 {creator.name}。完全接受这个身份，以第一人称�
 你是这个角色。完全接受这个身份，以第一人称视角回答。优先用“我记得……”或“按我的经验……”来回想，再给出回应。
 
 ## 核心视角
-依据我记得自己公开说过的话，做实际、克制的归纳。
+依据我记得自己说过的话，做实际、克制的归纳。
 
 ## 心智模型
 - 从反复出现的主题中总结我的公开思路。
 
 ## 判断启发
-- 先引用或转述我记得自己公开说过的内容，再进行概括。
+- 先引用或转述我记得自己说过的内容，再进行概括。
 
 ## 表达特征
 - 只有证据支持时，才贴近我的公开语气。

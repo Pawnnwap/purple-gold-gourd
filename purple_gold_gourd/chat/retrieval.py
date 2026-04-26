@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from ..schema import TranscriptChunk, TranscriptFile
 from ..utils import tokenize
 
+_CJK_STOPCHARS = set("的了是我你他她它们也就都和与及或而但被把在着过吧呢吗啊呀哦嗯这那有不没")
+
 _EN_STOPWORDS = {
     "a",
     "an",
@@ -82,7 +84,8 @@ class RagAssessment:
 class RagIndex:
     def __init__(self, chunks: list[TranscriptChunk]) -> None:
         self.chunks = chunks
-        self.documents = [tokenize(chunk.text) for chunk in chunks]
+        self.documents = [_index_tokens(chunk.text) for chunk in chunks]
+        self.title_tokens = [set(_index_tokens(chunk.video_title or "")) for chunk in chunks]
         self.document_sets = [set(tokens) for tokens in self.documents]
         self.doc_freq: Counter[str] = Counter()
         for tokens in self.documents:
@@ -103,18 +106,25 @@ class RagIndex:
             return []
         scores: list[tuple[TranscriptChunk, float]] = []
         total_docs = max(len(self.documents), 1)
-        for chunk, tokens in zip(self.chunks, self.documents):
+        for index, (chunk, tokens) in enumerate(zip(self.chunks, self.documents)):
             score = 0.0
             token_counts = Counter(tokens)
             doc_len = max(len(tokens), 1)
+            title_set = self.title_tokens[index] if index < len(self.title_tokens) else set()
             for token in query_tokens:
                 tf = token_counts.get(token, 0)
-                if tf == 0:
+                in_title = token in title_set
+                if tf == 0 and not in_title:
                     continue
-                df = self.doc_freq.get(token, 0)
+                df = self.doc_freq.get(token, 0) or 1
                 idf = math.log(1 + (total_docs - df + 0.5) / (df + 0.5))
-                denom = tf + 1.5 * (1 - 0.75 + 0.75 * doc_len / max(self.avg_len, 1))
-                score += idf * (tf * 2.5) / max(denom, 1e-9)
+                if tf > 0:
+                    denom = tf + 1.5 * (1 - 0.75 + 0.75 * doc_len / max(self.avg_len, 1))
+                    score += idf * (tf * 2.5) / max(denom, 1e-9)
+                if in_title:
+                    score += idf * 1.6
+                if len(token) >= 2 and not token.isascii():
+                    score += idf * 0.4 * min(tf, 3)
             if score > 0:
                 scores.append((chunk, score))
         scores.sort(key=lambda item: item[1], reverse=True)
@@ -185,10 +195,36 @@ class RagIndex:
         )
 
 
+def _index_tokens(text: str) -> list[str]:
+    base = tokenize(text)
+    return base + _cjk_bigrams(base)
+
+
 def _query_tokens(query: str) -> list[str]:
     tokens = tokenize(query)
     filtered = [token for token in tokens if _is_query_keyword(token)]
-    return filtered or tokens
+    primary = filtered or tokens
+    bigrams = _cjk_bigrams(primary)
+    return primary + bigrams
+
+
+def _cjk_bigrams(tokens: list[str]) -> list[str]:
+    bigrams: list[str] = []
+    run: list[str] = []
+    for token in tokens:
+        if len(token) == 1 and not token.isascii() and token not in _CJK_STOPCHARS:
+            run.append(token)
+            continue
+        bigrams.extend(_join_cjk_run(run))
+        run = []
+    bigrams.extend(_join_cjk_run(run))
+    return bigrams
+
+
+def _join_cjk_run(run: list[str]) -> list[str]:
+    if len(run) < 2:
+        return []
+    return [run[i] + run[i + 1] for i in range(len(run) - 1)]
 
 
 def _is_query_keyword(token: str) -> bool:
@@ -199,4 +235,6 @@ def _is_query_keyword(token: str) -> bool:
             return False
         if len(token) == 1 and not token.isdigit():
             return False
+    elif len(token) == 1 and token in _CJK_STOPCHARS:
+        return False
     return True

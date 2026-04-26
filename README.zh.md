@@ -17,7 +17,7 @@
 3. 使用 FunASR SenseVoice 转录，并保留时间戳与语言识别结果；也支持通过 CLI 导入本地音频或视频文件。
 4. 导出 JSON 转录文件和对应 `.srt` 字幕。
 5. 可在每个角色目录下的 `documents/` 文件夹中放入自定义 `.md` 文件；这些资料也会参与 skill 生成与 RAG。
-6. 通过本地 OpenAI 兼容 LLM 提炼人格 `skill.md`。
+6. 通过配置的 OpenAI 兼容 LLM 提炼人格 `skill.md`。
 7. 对转录片段和自定义资料建立 BM25 检索索引。
 8. 当视频知识检索不足时，自动回退到网页搜索，并把结果作为外部 `Background info (背景信息)` 注入，而不是误当作角色自己的记忆。
 9. 角色初始化时若检测到 `transcripts/` 或 `documents/` 有更新，会自动重生成 skill。
@@ -29,7 +29,7 @@
 
 - Python 3.11 或更高版本
 - `ffmpeg` 在 `PATH` 中可用，或通过 `FFMPEG_PATH` 指定路径
-- 用于 skill 提炼和人格对话的 OpenAI 兼容聊天接口；默认目标为 LM Studio `http://127.0.0.1:1234/v1`
+- 用于 skill 提炼和人格对话的 OpenAI 兼容聊天接口；默认目标为 Google Gemini OpenAI-compatible endpoint `https://generativelanguage.googleapis.com/v1beta/openai/`
 
 ```powershell
 # 推荐：完整本地体验
@@ -212,6 +212,7 @@ python -m purple_gold_gourd.cli "208259" --platform bilibili
 | `OPENAI_BASE_URL` | LLM 端点 |
 | `OPENAI_API_KEY` | LLM API Key |
 | `OPENAI_MODEL` | 首选模型 |
+| `OPENAI_MODEL_BACKUP` / `OPENAI_MODEL_BACKUPS` | 显式备用模型列表，默认 `gemma-4-26b-a4b-it` |
 | `OPENAI_MAX_CONTEXT_TOKENS` | 默认上下文预算 |
 | `OPENAI_MAX_TOKENS` | 默认输出预算 |
 | `OPENAI_MODEL_CONTEXT_TOKENS` | 按模型指定上下文预算 |

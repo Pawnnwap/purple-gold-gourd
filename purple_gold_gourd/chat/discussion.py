@@ -6,7 +6,9 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import AppConfig
-from ..schema import ProfileManifest
+from ..plugins.tts.base import VoiceSynthesizer
+from ..plugins.tts.shared import prepare_tts_text
+from ..schema import ProfileManifest, VoiceSample
 from ..utils import ensure_dir, slugify, write_json
 from .persona import PersonaChat
 
@@ -40,6 +42,7 @@ class DiscussionTurnRecord:
     text: str
     citations: list[str]
     audio_path: str = ""
+    spoken_text: str = ""
     created_at: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -66,7 +69,15 @@ class DiscussionTurnRecord:
 @dataclass(slots=True)
 class PreparedDiscussionTurn:
     record: DiscussionTurnRecord
+    spoken_answer: str
     audio_file: Path | None = None
+
+
+@dataclass(slots=True)
+class SpeechSynthesisJob:
+    turn: DiscussionTurnRecord
+    audio_file: Path
+    future: Future[Path]
 
 
 class DiscussionPlaybackQueue:
@@ -75,10 +86,14 @@ class DiscussionPlaybackQueue:
         self._tail: Future[None] | None = None
         self._shutdown = False
 
-    def enqueue(self, participant: DiscussionParticipant, audio_file: Path) -> None:
+    def enqueue_future(self, participant: DiscussionParticipant, audio_future: Future[Path]) -> None:
         if self._shutdown:
             return
-        self._tail = self._executor.submit(participant.chat.player.play, audio_file, True)
+
+        def _play_when_ready() -> None:
+            participant.chat.player.play(audio_future.result(), True)
+
+        self._tail = self._executor.submit(_play_when_ready)
 
     def wait(self) -> None:
         if self._tail is not None:
@@ -91,10 +106,79 @@ class DiscussionPlaybackQueue:
         self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
 
 
+class DiscussionSpeechSynthesizer:
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="discussion-tts")
+        self._jobs: list[SpeechSynthesisJob] = []
+        self._synthesizer: VoiceSynthesizer | None = None
+        self._shutdown = False
+
+    @property
+    def has_jobs(self) -> bool:
+        return bool(self._jobs)
+
+    def submit(
+        self,
+        participant: DiscussionParticipant,
+        turn: DiscussionTurnRecord,
+        spoken_answer: str,
+        audio_dir: Path,
+        voice_sample: VoiceSample | None = None,
+    ) -> SpeechSynthesisJob:
+        if self._shutdown:
+            raise RuntimeError("Speech synthesizer has already been shut down.")
+        slug = turn.character_slug or participant.slug
+        audio_file = audio_dir / f"{turn.turn_number:03d}-round{turn.round_number:02d}-{slug}.wav"
+        turn.audio_path = str(audio_file.relative_to(audio_dir.parent))
+        sample = voice_sample or participant.manifest.voice_sample
+        if sample is None:
+            raise ValueError(f"No voice sample is available for {participant.name}.")
+        future = self._executor.submit(
+            self._synthesize_with_voice_sample,
+            participant,
+            spoken_answer,
+            audio_file,
+            sample,
+        )
+        job = SpeechSynthesisJob(turn=turn, audio_file=audio_file, future=future)
+        self._jobs.append(job)
+        return job
+
+    def _synthesize_with_voice_sample(
+        self,
+        participant: DiscussionParticipant,
+        spoken_answer: str,
+        audio_file: Path,
+        voice_sample: VoiceSample,
+    ) -> Path:
+        if self._synthesizer is None:
+            self._synthesizer = participant.chat.tts.create_synthesizer()
+        spoken_text = participant.chat.tts.prepare_spoken_text(spoken_answer, char_limit=4000)
+        return self._synthesizer.synthesize(
+            text=spoken_text,
+            prompt_text=voice_sample.prompt_text,
+            prompt_audio=Path(voice_sample.audio_path),
+            target=audio_file,
+        )
+
+    def wait_all(self) -> None:
+        for job in self._jobs:
+            job.future.result()
+
+    def shutdown(self, wait: bool, cancel_futures: bool) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
 def create_discussion_record_dir(config: AppConfig, topic: str) -> Path:
     discussions_dir = ensure_dir(config.data_dir / "discussions")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    topic_slug = slugify(topic)[:60] or "discussion"
+    first_line = next((line.strip() for line in topic.splitlines() if line.strip()), topic)
+    words = first_line.split()
+    short_topic = " ".join(words[:30]) if len(words) > 30 else first_line
+    topic_slug = slugify(short_topic)[:80] or "discussion"
     return ensure_dir(discussions_dir / f"{stamp}-{topic_slug}")
 
 
@@ -105,8 +189,6 @@ def prepare_discussion_turn(
     prior_turns: list[DiscussionTurnRecord],
     round_number: int,
     total_rounds: int,
-    speak_enabled: bool,
-    audio_dir: Path,
 ) -> PreparedDiscussionTurn:
     response = participant.chat.discuss(
         topic=topic,
@@ -116,16 +198,7 @@ def prepare_discussion_turn(
         total_rounds=total_rounds,
     )
     turn_number = len(prior_turns) + 1
-    audio_path = ""
-    audio_file = None
-    if speak_enabled and participant.voice_available:
-        audio_target = audio_dir / f"{turn_number:03d}-round{round_number:02d}-{participant.slug}.wav"
-        audio_file = participant.chat.speak(
-            response.spoken_answer,
-            target=audio_target,
-            play=False,
-        )
-        audio_path = str(audio_file.relative_to(audio_dir.parent))
+    spoken_text = prepare_tts_text(response.spoken_answer, char_limit=4000)
     return PreparedDiscussionTurn(
         record=DiscussionTurnRecord(
             round_number=round_number,
@@ -135,37 +208,12 @@ def prepare_discussion_turn(
             character_slug=participant.manifest.creator_slug,
             text=response.display_answer,
             citations=response.citations,
-            audio_path=audio_path,
+            audio_path="",
+            spoken_text=spoken_text,
             created_at=datetime.now().isoformat(timespec="seconds"),
         ),
-        audio_file=audio_file,
+        spoken_answer=spoken_text,
     )
-
-
-def run_discussion_turn(
-    participant: DiscussionParticipant,
-    topic: str,
-    participants: list[DiscussionParticipant],
-    prior_turns: list[DiscussionTurnRecord],
-    round_number: int,
-    total_rounds: int,
-    speak_enabled: bool,
-    audio_dir: Path,
-) -> DiscussionTurnRecord:
-    prepared = prepare_discussion_turn(
-        participant=participant,
-        topic=topic,
-        participants=participants,
-        prior_turns=prior_turns,
-        round_number=round_number,
-        total_rounds=total_rounds,
-        speak_enabled=speak_enabled,
-        audio_dir=audio_dir,
-    )
-    if speak_enabled and prepared.audio_file is not None:
-        participant.chat.player.play(prepared.audio_file, wait=True)
-    return prepared.record
-
 
 def stop_discussion_audio(participants: list[DiscussionParticipant]) -> None:
     for participant in participants:
@@ -260,6 +308,90 @@ def _render_discussion_markdown(
     return "\n".join(lines).strip() + "\n"
 
 
+def prepare_host_turn(
+    topic: str,
+    participants: list[DiscussionParticipant],
+    prior_turns: list[DiscussionTurnRecord],
+    round_number: int,
+    total_rounds: int,
+) -> DiscussionTurnRecord:
+    """Generate a host/moderator intro turn at the start of each round."""
+    ref = participants[0].chat
+    llm = ref.llm
+    language = ref.language
+    participant_names = "、".join(p.name for p in participants) if language == "zh" else ", ".join(p.name for p in participants)
+
+    non_host = [t for t in prior_turns if t.character_slug != "host"]
+    recent = non_host[-8:]
+
+    if language == "zh":
+        sys_prompt = (
+            "你是一位中立专业的讨论节目主持人。\n"
+            "每轮开场须做到三点：\n"
+            "①简要概括话题背景和已有讨论要点（首轮则介绍事件背景）\n"
+            "②补充必要的背景资料或关键事实\n"
+            "③点明本轮讨论的核心焦点或值得深挖的方向\n"
+            "语言简练有力，不加主观立场。只输出纯文本，一段话，适合口播朗读。"
+        )
+        prior_text = ""
+        if recent:
+            prior_text = "\n前几轮发言摘要：\n" + "\n".join(
+                f"第{t.round_number}轮 {t.speaker}：{t.text[:150]}{'...' if len(t.text) > 150 else ''}"
+                for t in recent
+            )
+        user_prompt = (
+            f"话题：\n{topic}\n"
+            f"{prior_text}\n"
+            f"本场嘉宾（发言顺序）：{participant_names}\n"
+            f"请开始第 {round_number}/{total_rounds} 轮的主持开场。"
+        )
+        speaker = "主持人"
+    else:
+        sys_prompt = (
+            "You are a neutral, professional discussion host.\n"
+            "Each round opening must cover three things: "
+            "①briefly summarize the topic and prior discussion points (or introduce the topic if round 1) "
+            "②add necessary background or key facts "
+            "③identify the core focus or angle worth digging into this round.\n"
+            "Be concise and objective. Plain text only, one paragraph, suitable for reading aloud."
+        )
+        prior_text = ""
+        if recent:
+            prior_text = "\nPrior discussion summary:\n" + "\n".join(
+                f"Round {t.round_number} {t.speaker}: {t.text[:150]}{'...' if len(t.text) > 150 else ''}"
+                for t in recent
+            )
+        user_prompt = (
+            f"Topic:\n{topic}\n"
+            f"{prior_text}\n"
+            f"Guests (speaking order): {participant_names}\n"
+            f"Please open round {round_number}/{total_rounds}."
+        )
+        speaker = "Host"
+
+    messages = [
+        {"role": "system", "content": _with_brevity_prompt(sys_prompt, getattr(ref.config, "brevity", False), language)},
+        {"role": "user", "content": user_prompt},
+    ]
+    raw, _ = llm.complete(messages=messages, temperature=0.5)
+    raw = ref._plain_text(raw)
+    spoken = prepare_tts_text(raw, char_limit=4000)
+    turn_number = len(prior_turns) + 1
+
+    return DiscussionTurnRecord(
+        round_number=round_number,
+        turn_number=turn_number,
+        speaker=speaker,
+        character_query="host",
+        character_slug="host",
+        text=raw,
+        citations=[],
+        audio_path="",
+        spoken_text=spoken,
+        created_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
+
 def _render_discussion_text(turns: list[DiscussionTurnRecord]) -> str:
     lines: list[str] = []
     current_round = None
@@ -270,3 +402,14 @@ def _render_discussion_text(turns: list[DiscussionTurnRecord]) -> str:
         lines.append(f"{turn.speaker}: {turn.text}")
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def _with_brevity_prompt(prompt: str, enabled: bool, language: str) -> str:
+    if not enabled:
+        return prompt
+    suffix = (
+        "保持简洁。每次回复控制在120字以内，最多一段。"
+        if language == "zh"
+        else "Be brief. Keep each reply under 80 words, one paragraph max."
+    )
+    return f"{prompt.rstrip()}\n\n{suffix}"

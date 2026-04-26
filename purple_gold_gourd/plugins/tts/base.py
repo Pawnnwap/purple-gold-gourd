@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Protocol
 
 from ...config import AppConfig
-from ...schema import TranscriptFile, VoiceSample
 from ..stt.base import SpeechTranscriber
 
 
@@ -35,14 +34,6 @@ class TTSPlugin(ABC):
 
     def create_audio_output(self) -> AudioOutput:
         raise NotImplementedError("Subclass must implement create_audio_output")
-
-    def choose_voice_sample(
-        self,
-        transcriber: SpeechTranscriber,
-        transcripts: list[TranscriptFile],
-        output_dir: Path,
-    ) -> VoiceSample | None:
-        raise NotImplementedError("Subclass must implement choose_voice_sample")
 
     def prepare_spoken_text(self, text: str, char_limit: int = 360) -> str:
         raise NotImplementedError("Subclass must implement prepare_spoken_text")

@@ -106,6 +106,7 @@ class CreatorResolver:
             followers=int(info.get("channel_follower_count") or 0),
             handle=str(handle),
             bio=str(info.get("description") or ""),
+            avatar_url=self._youtube_info_thumbnail(info),
         )
 
     def _resolve_bilibili_url(self, query: str) -> CreatorRef:
@@ -138,6 +139,7 @@ class CreatorResolver:
             followers=parse_human_number(self._youtube_text(picked.get("subscriberCountText"))),
             handle=self._youtube_handle(picked),
             bio=self._youtube_text(picked.get("descriptionSnippet")),
+            avatar_url=self._youtube_renderer_thumbnail(picked),
         )
 
     def _resolve_youtube_name_fallback(self, query: str) -> CreatorRef:
@@ -214,6 +216,7 @@ class CreatorResolver:
         bio: str = "",
     ) -> CreatorRef:
         base = f"https://space.bilibili.com/{mid}"
+        card: dict[str, object] = {}
         if not name:
             card = self._fetch_bilibili_card(mid)
             if card:
@@ -251,6 +254,7 @@ class CreatorResolver:
             query=query,
             followers=fans,
             bio=bio,
+            avatar_url=str((card or {}).get("face") or ""),
         )
 
     def _prime_bilibili_cookies(self) -> None:
@@ -393,6 +397,26 @@ class CreatorResolver:
         if isinstance(node, list):
             return "".join(self._youtube_text(item) for item in node)
         return clean_html(str(node))
+
+    def _youtube_info_thumbnail(self, info: dict[str, object]) -> str:
+        thumbnails = info.get("thumbnails") or []
+        if isinstance(thumbnails, list):
+            urls = [str(item.get("url") or "") for item in thumbnails if isinstance(item, dict)]
+            urls = [url for url in urls if url]
+            if urls:
+                return urls[-1]
+        return str(info.get("thumbnail") or "")
+
+    def _youtube_renderer_thumbnail(self, renderer: dict[str, object]) -> str:
+        thumbnail = renderer.get("thumbnail")
+        if isinstance(thumbnail, dict):
+            thumbnails = thumbnail.get("thumbnails") or []
+            if isinstance(thumbnails, list):
+                urls = [str(item.get("url") or "") for item in thumbnails if isinstance(item, dict)]
+                urls = [url for url in urls if url]
+                if urls:
+                    return urls[-1]
+        return ""
 
     def _extract_json_blob(self, html: str, variable_name: str) -> dict[str, object]:
         patterns = [

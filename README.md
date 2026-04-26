@@ -14,7 +14,7 @@ Named after the Purple-Gold Gourd from *Journey to the West*: "Dare you answer m
 3. Transcribes with FunASR SenseVoice, including timestamps and language detection, and can also ingest local audio or video files through the CLI.
 4. Exports each transcript as JSON and `.srt`.
 5. Lets you drop custom `.md` files into each character's `documents/` folder; those files also participate in skill generation and RAG.
-6. Distills a persona `skill.md` with a local OpenAI-compatible LLM.
+6. Distills a persona `skill.md` with the configured OpenAI-compatible LLM.
 7. Builds BM25 retrieval over transcript chunks and custom documents.
 8. Falls back to web search when transcript evidence is too thin, and injects that material as external `Background info (背景信息)` instead of persona memory.
 9. Automatically refreshes the skill when transcripts or custom documents in the character data folder change.
@@ -26,7 +26,7 @@ Prerequisites:
 
 - Python 3.11 or newer
 - `ffmpeg` available on your `PATH` or configured through `FFMPEG_PATH`
-- An OpenAI-compatible chat endpoint for skill distillation and persona chat; the defaults target LM Studio at `http://127.0.0.1:1234/v1`
+- An OpenAI-compatible chat endpoint for skill distillation and persona chat; defaults target Google's OpenAI-compatible Gemini endpoint at `https://generativelanguage.googleapis.com/v1beta/openai/`
 
 ```powershell
 # Recommended: full local experience
@@ -130,6 +130,9 @@ purple-gold-gourd "@LinusTechTips" --platform youtube
 purple-gold-gourd "@LinusTechTips" --series 1 3 8
 purple-gold-gourd "@LinusTechTips" --series 2,5,9
 
+# Render a narrated discussion video with avatars, waveform, and timed subtitles
+purple-gold-gourd discuss "Alice" "Bob" --topic "Should creators rely on AI tools?" --rounds 2 --to-video
+
 # Import local audio/video into an existing character
 purple-gold-gourd "敬汉卿" --media D:\clips\interview.mp3 D:\clips\livestream.mp4
 
@@ -199,6 +202,7 @@ Discussion mode flags:
 | `--topic` | required | Discussion topic |
 | `--rounds` | `3` | Full discussion rounds; each character speaks once per round |
 | `--speak` | off | Start the discussion with speech playback enabled |
+| `--to-video` | off | Render `video/discussion.mp4`; implies speech synthesis, requires voice prompts for all participants, and writes aligned `.srt`/`.ass` subtitles from generated audio durations |
 
 ## Environment overrides
 
@@ -209,6 +213,7 @@ Project-specific overrides use the `PURPLE_GOLD_GOURD_*` prefix.
 | `OPENAI_BASE_URL` | LLM endpoint |
 | `OPENAI_API_KEY` | LLM API key |
 | `OPENAI_MODEL` | Preferred model name |
+| `OPENAI_MODEL_BACKUP` / `OPENAI_MODEL_BACKUPS` | Explicit fallback model list, default `gemma-4-26b-a4b-it` |
 | `OPENAI_MAX_CONTEXT_TOKENS` | Default prompt-context budget |
 | `OPENAI_MAX_TOKENS` | Default completion budget |
 | `OPENAI_MODEL_CONTEXT_TOKENS` | Per-model context limits |
@@ -228,6 +233,7 @@ Project-specific overrides use the `PURPLE_GOLD_GOURD_*` prefix.
 | `QWEN3_TTS_CHUNK_CHARS` | Approximate chars per TTS chunk |
 | `QWEN3_TTS_DO_SAMPLE` | Enable or disable Qwen3-TTS sampling |
 | `QWEN3_TTS_MAX_NEW_TOKENS` | Optional generation cap for TTS |
+| `QWEN3_TTS_X_VECTOR_ONLY` | Use speaker embedding only for voice clone prompts, default `true`, to prevent reference audio leaking into synthesized output |
 | `FFMPEG_PATH` | ffmpeg binary path |
 
 ## Data layout
@@ -249,6 +255,7 @@ data/creators/<platform>-<id>-<name>/
 Put any custom markdown files you want the persona to use into `documents/`. No extra command is needed; the next character initialization will pick them up automatically and refresh the skill when needed.
 
 Discussion records are saved separately under `data/discussions/<timestamp>-<topic>/`, including `discussion.json`, `discussion.md`, `discussion.txt`, and an `audio/` folder when discussion speech is enabled.
+When `--to-video` is used, the same folder also includes `video/discussion.mp4`, `video/discussion-audio.wav`, `video/discussion.srt`, `video/discussion.ass`, creator avatar assets, and render metadata.
 
 ---
 

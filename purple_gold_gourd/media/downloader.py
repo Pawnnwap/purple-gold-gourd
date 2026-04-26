@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 from datetime import UTC
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import requests
 from yt_dlp import YoutubeDL
 
 from ..schema import CreatorRef, VideoInfo
@@ -35,9 +37,9 @@ class MediaDownloader:
         }
         self._bili_headers_seeded = False
 
-    def rank_creator_videos(self, creator: CreatorRef, scan_limit: int = 30) -> list[VideoInfo]:
+    def list_creator_videos(self, creator: CreatorRef, scan_limit: int = 30) -> list[VideoInfo]:
         if creator.platform == "bilibili" and creator.creator_id.isdigit():
-            return self._rank_bilibili_creator_videos(creator, scan_limit)
+            return self._list_bilibili_creator_videos(creator, scan_limit)
         entries = self._list_entries(creator.video_tab_url, creator.platform, scan_limit)
         videos: list[VideoInfo] = []
         seen: set[str] = set()
@@ -54,48 +56,97 @@ class MediaDownloader:
                 continue
             seen.add(video.video_id)
             videos.append(video)
-        videos.sort(key=lambda item: item.hotness, reverse=True)
-        return videos
+        return videos[:scan_limit]
 
-    def _rank_bilibili_creator_videos(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+    def find_creator_videos_by_title_keyword(
+        self,
+        creator: CreatorRef,
+        keyword: str,
+        scan_limit: int = 100,
+    ) -> list[VideoInfo]:
+        keyword = keyword.strip()
+        if not keyword:
+            return []
+        if creator.platform == "bilibili" and creator.creator_id.isdigit():
+            videos = self._search_bilibili_videos_by_keyword(creator, keyword, scan_limit)
+            if videos:
+                return videos
+        return [
+            video
+            for video in self.list_creator_videos(creator, scan_limit=scan_limit)
+            if keyword.lower() in video.title.lower()
+        ]
+
+    def _list_bilibili_creator_videos(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
         # Try bilibili-api-python first — it uses a more browser-authentic HTTP stack
         # that bypasses risk control better than plain requests + WBI signing.
-        videos = self._rank_bilibili_videos_biliapi(creator, scan_limit)
+        videos = self._list_bilibili_videos_biliapi(creator, scan_limit)
         if videos:
-            videos.sort(key=lambda item: item.hotness, reverse=True)
-            return videos
+            return videos[:scan_limit]
 
         # Fall back to our own WBI-signed API.
-        seen: dict[str, VideoInfo] = {}
+        videos: list[VideoInfo] = []
+        seen: set[str] = set()
         page_size = min(max(scan_limit, 3), 40)
         page_count = max(math.ceil(max(scan_limit, 1) / page_size), 1)
-        for order in ("click", "pubdate"):
-            for page in range(1, page_count + 1):
-                try:
-                    items = self._fetch_bilibili_vlist(
-                        creator.creator_id,
-                        order=order,
-                        page=page,
-                        page_size=page_size,
-                    )
-                except Exception:
+        for page in range(1, page_count + 1):
+            try:
+                items = self._fetch_bilibili_vlist(
+                    creator.creator_id,
+                    order="pubdate",
+                    page=page,
+                    page_size=page_size,
+                )
+            except Exception:
+                continue
+            for item in items:
+                video = self._video_from_bilibili_arc(item, creator)
+                if not video.video_id or video.video_id in seen:
                     continue
-                for item in items:
-                    video = self._video_from_bilibili_arc(item, creator)
-                    if not video.video_id:
-                        continue
-                    existing = seen.get(video.video_id)
-                    if existing is None or video.hotness > existing.hotness:
-                        seen[video.video_id] = video
-        videos = list(seen.values())
+                seen.add(video.video_id)
+                videos.append(video)
+                if len(videos) >= scan_limit:
+                    return videos
         if not videos:
-            videos = self._rank_bilibili_videos_ytdlp(creator, scan_limit)
+            videos = self._list_bilibili_videos_ytdlp(creator, scan_limit)
         if not videos:
-            videos = self._rank_bilibili_videos_playwright(creator, scan_limit)
-        videos.sort(key=lambda item: item.hotness, reverse=True)
-        return videos
+            videos = self._list_bilibili_videos_playwright(creator, scan_limit)
+        return videos[:scan_limit]
 
-    def _rank_bilibili_videos_biliapi(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+    def _search_bilibili_videos_by_keyword(
+        self,
+        creator: CreatorRef,
+        keyword: str,
+        scan_limit: int,
+    ) -> list[VideoInfo]:
+        videos: list[VideoInfo] = []
+        seen: set[str] = set()
+        page_size = 30
+        page_count = max(math.ceil(max(scan_limit, 1) / page_size), 1)
+        for page in range(1, page_count + 1):
+            try:
+                items = self._fetch_bilibili_vlist(
+                    creator.creator_id,
+                    order="pubdate",
+                    page=page,
+                    page_size=page_size,
+                    keyword=keyword,
+                )
+            except Exception:
+                continue
+            if not items:
+                break
+            for item in items:
+                video = self._video_from_bilibili_arc(item, creator)
+                if not video.video_id or video.video_id in seen or keyword.lower() not in video.title.lower():
+                    continue
+                seen.add(video.video_id)
+                videos.append(video)
+                if len(videos) >= scan_limit:
+                    return videos
+        return videos[:scan_limit]
+
+    def _list_bilibili_videos_biliapi(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
         try:
             from bilibili_api import user as bili_user
             import asyncio
@@ -103,12 +154,13 @@ class MediaDownloader:
             async def _fetch():
                 u = bili_user.User(uid=int(creator.creator_id))
                 result = []
-                for order in (bili_user.VideoOrder.VIEW, bili_user.VideoOrder.PUBDATE):
-                    try:
-                        data = await u.get_videos(pn=1, ps=min(scan_limit, 30), order=order)
-                        result.extend((data.get("list") or {}).get("vlist") or [])
-                    except Exception:
-                        pass
+                page_size = min(max(scan_limit, 1), 30)
+                page_count = max(math.ceil(max(scan_limit, 1) / page_size), 1)
+                for page in range(1, page_count + 1):
+                    data = await u.get_videos(pn=page, ps=page_size, order=bili_user.VideoOrder.PUBDATE)
+                    result.extend((data.get("list") or {}).get("vlist") or [])
+                    if len(result) >= scan_limit:
+                        break
                 return result
 
             try:
@@ -131,9 +183,9 @@ class MediaDownloader:
             if video.video_id and video.video_id not in seen:
                 seen.add(video.video_id)
                 videos.append(video)
-        return videos
+        return videos[:scan_limit]
 
-    def _rank_bilibili_videos_ytdlp(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+    def _list_bilibili_videos_ytdlp(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
         entries: list[dict[str, object]] = []
         for browser in ("edge", "chrome", "firefox", None):
             try:
@@ -165,9 +217,9 @@ class MediaDownloader:
                 view_count=view_count,
                 hotness=hotness_score(views=view_count, published_at=published),
             ))
-        return videos
+        return videos[:scan_limit]
 
-    def _rank_bilibili_videos_playwright(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
+    def _list_bilibili_videos_playwright(self, creator: CreatorRef, scan_limit: int) -> list[VideoInfo]:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -265,6 +317,8 @@ class MediaDownloader:
         wav_path = output_dir / f"{video.video_id}.wav"
         if wav_path.exists():
             return wav_path
+        if video.platform == "bilibili":
+            return self._download_bilibili_audio_direct(video, output_dir, wav_path)
         info = self._extract_video_info(video.url)
         format_spec = self._pick_audio_only_format(info)
         opts = {
@@ -298,6 +352,179 @@ class MediaDownloader:
             return candidates[-1]
         raise FileNotFoundError(f"Audio download finished but no file was found for {video.video_id}.")
 
+    def _download_bilibili_audio_direct(self, video: VideoInfo, output_dir: Path, wav_path: Path) -> Path:
+        bvid = self._normalize_bilibili_bvid(video.video_id)
+        if not bvid:
+            raise ValueError("Bilibili video has no bvid.")
+        self._resolver._prime_bilibili_cookies()
+        view = self._resolver.session.get(
+            "https://api.bilibili.com/x/web-interface/view",
+            params={"bvid": bvid},
+            timeout=20,
+        ).json()
+        data = view.get("data") or {}
+        cid = data.get("cid")
+        if not cid:
+            pages = data.get("pages") or []
+            if pages:
+                cid = pages[0].get("cid")
+        if not cid:
+            raise ValueError(f"Could not resolve cid for {bvid}.")
+        play = self._fetch_bilibili_playurl(bvid, int(cid))
+        play_data = play.get("data") or {}
+        audio_items = ((play_data.get("dash") or {}).get("audio") or [])
+        if audio_items:
+            picked = max(audio_items, key=lambda item: int(item.get("bandwidth") or 0))
+            media_urls = [
+                str(url)
+                for url in [
+                    picked.get("baseUrl") or picked.get("base_url"),
+                    *(picked.get("backupUrl") or picked.get("backup_url") or []),
+                ]
+                if url
+            ]
+            suffix = ".m4s"
+        else:
+            durl_items = play_data.get("durl") or []
+            if not durl_items:
+                raise ValueError(f"No DASH audio or legacy durl stream found for {bvid}.")
+            picked = max(durl_items, key=lambda item: int(item.get("size") or 0))
+            media_urls = [
+                str(url)
+                for url in [
+                    picked.get("url"),
+                    *(picked.get("backup_url") or picked.get("backupUrl") or []),
+                ]
+                if url
+            ]
+            suffix = ".mp4"
+        if not media_urls:
+            raise ValueError(f"No media URL found for {bvid}.")
+        temp_path = output_dir / f"{bvid}{suffix}"
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": f"https://www.bilibili.com/video/{bvid}",
+            "Origin": "https://www.bilibili.com",
+        }
+        self._download_url_ranges(media_urls, headers, temp_path)
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-i",
+            str(temp_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-acodec",
+            "pcm_s16le",
+            str(wav_path),
+        ]
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if completed.returncode != 0 or not wav_path.exists():
+            raise RuntimeError((completed.stderr or "").strip() or f"ffmpeg failed for {bvid}")
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return wav_path
+
+    def _download_url_ranges(self, urls: list[str], headers: dict[str, str], target: Path) -> None:
+        total_size = self._probe_range_size(urls, headers)
+        chunk_size = 900_000
+        with target.open("wb") as handle:
+            if total_size <= 0:
+                content = self._fetch_range(urls, headers, None, None)
+                handle.write(content)
+                return
+            start = 0
+            while start < total_size:
+                end = min(start + chunk_size - 1, total_size - 1)
+                content = self._fetch_range(urls, headers, start, end)
+                expected = end - start + 1
+                if len(content) != expected:
+                    raise RuntimeError(
+                        f"Downloaded range {start}-{end} had {len(content)} bytes, expected {expected}.",
+                    )
+                handle.write(content)
+                start = end + 1
+
+    def _probe_range_size(self, urls: list[str], headers: dict[str, str]) -> int:
+        for url in urls:
+            try:
+                response = requests.get(
+                    url,
+                    headers={**headers, "Range": "bytes=0-0"},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                content_range = response.headers.get("Content-Range") or response.headers.get("content-range") or ""
+                match = re.search(r"/(\d+)$", content_range)
+                if match:
+                    return int(match.group(1))
+                content_length = response.headers.get("Content-Length") or response.headers.get("content-length")
+                if content_length:
+                    return int(content_length)
+            except Exception:
+                continue
+        return 0
+
+    def _fetch_range(
+        self,
+        urls: list[str],
+        headers: dict[str, str],
+        start: int | None,
+        end: int | None,
+    ) -> bytes:
+        range_header = f"bytes={start}-{end}" if start is not None and end is not None else ""
+        errors: list[str] = []
+        for _ in range(2):
+            for url in urls:
+                try:
+                    request_headers = dict(headers)
+                    if range_header:
+                        request_headers["Range"] = range_header
+                    response = requests.get(url, headers=request_headers, timeout=45)
+                    response.raise_for_status()
+                    return response.content
+                except Exception as exc:
+                    errors.append(str(exc))
+                    continue
+        raise RuntimeError(f"Could not download audio range {range_header or '<full>'}: {' | '.join(errors[-3:])}")
+
+    def _fetch_bilibili_playurl(self, bvid: str, cid: int) -> dict[str, object]:
+        params = {
+            "bvid": bvid,
+            "cid": cid,
+            "fnval": 16,
+            "fourk": 1,
+        }
+        response = self._resolver.session.get(
+            "https://api.bilibili.com/x/player/playurl",
+            params=params,
+            timeout=20,
+        )
+        payload = response.json()
+        data = payload.get("data") or {}
+        audio_items = ((data.get("dash") or {}).get("audio") or [])
+        if audio_items or data.get("durl"):
+            return payload
+        signed = self._resolver._sign_wbi({**params, "platform": "web"})
+        response = self._resolver.session.get(
+            "https://api.bilibili.com/x/player/wbi/playurl",
+            params=signed,
+            timeout=20,
+        )
+        return response.json()
+
     def transcode_local_media(self, source_path: Path, output_dir: Path, target_stem: str) -> Path:
         ensure_dir(output_dir)
         resolved_source = source_path.resolve()
@@ -325,6 +552,8 @@ class MediaDownloader:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if completed.returncode != 0 or not wav_path.exists():
             stderr = (completed.stderr or "").strip()
@@ -426,7 +655,14 @@ class MediaDownloader:
         with YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False) or {}
 
-    def _fetch_bilibili_vlist(self, mid: str, order: str, page: int, page_size: int) -> list[dict[str, object]]:
+    def _fetch_bilibili_vlist(
+        self,
+        mid: str,
+        order: str,
+        page: int,
+        page_size: int,
+        keyword: str = "",
+    ) -> list[dict[str, object]]:
         params = {
             "mid": mid,
             "pn": page,
@@ -435,7 +671,7 @@ class MediaDownloader:
             "special_type": "",
             "order": order,
             "index": 0,
-            "keyword": "",
+            "keyword": keyword,
             "order_avoided": "true",
             "platform": "web",
             "web_location": "333.1387",
@@ -444,7 +680,7 @@ class MediaDownloader:
         payload = self._request_bilibili_arc_search(params)
 
         if (payload.get("code") or 0) != 0:
-            payload = self._fetch_bilibili_vlist_unsigned(mid, order, page, page_size)
+            payload = self._fetch_bilibili_vlist_unsigned(mid, order, page, page_size, keyword=keyword)
 
         if (payload.get("code") or 0) != 0:
             try:
@@ -458,14 +694,21 @@ class MediaDownloader:
         listing = data.get("list") or {}
         return listing.get("vlist") or []
 
-    def _fetch_bilibili_vlist_unsigned(self, mid: str, order: str, page: int, page_size: int) -> dict[str, object]:
+    def _fetch_bilibili_vlist_unsigned(
+        self,
+        mid: str,
+        order: str,
+        page: int,
+        page_size: int,
+        keyword: str = "",
+    ) -> dict[str, object]:
         params = {
             "mid": mid,
             "pn": page,
             "ps": page_size,
             "order": order,
             "tid": 0,
-            "keyword": "",
+            "keyword": keyword,
             "jsonp": "jsonp",
         }
         try:
@@ -554,11 +797,12 @@ class MediaDownloader:
         created = int(item.get("created") or 0)
         published = parse_upload_datetime(timestamp=created)
         duration = self._parse_duration(item.get("length"))
+        bvid = self._normalize_bilibili_bvid(str(item.get("bvid") or ""))
         return VideoInfo(
             platform="bilibili",
-            video_id=str(item.get("bvid") or ""),
+            video_id=bvid,
             title=str(item.get("title") or ""),
-            url=f"https://www.bilibili.com/video/{item.get('bvid')}",
+            url=f"https://www.bilibili.com/video/{bvid}",
             uploader=str(item.get("author") or creator.name),
             duration_sec=duration,
             published_at=published.astimezone(UTC).isoformat() if published else "",
@@ -574,6 +818,16 @@ class MediaDownloader:
                 published_at=published,
             ),
         )
+
+    def _normalize_bilibili_bvid(self, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.startswith("BV"):
+            return text
+        if len(text) >= 10 and text[0].isalnum():
+            return f"BV{text}"
+        return text
 
     def _parse_duration(self, value: object) -> int:
         if isinstance(value, int):

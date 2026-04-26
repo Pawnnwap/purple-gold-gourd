@@ -17,13 +17,16 @@ class CreatorRef:
     bio: str = ""
     language: str = ""
     followers: int = 0
+    avatar_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CreatorRef:
-        return cls(**data)
+        payload = dict(data)
+        payload.setdefault("avatar_url", "")
+        return cls(**payload)
 
 
 @dataclass(slots=True)
@@ -102,18 +105,26 @@ class TranscriptFile:
 
 @dataclass(slots=True)
 class VoiceSample:
-    audio_path: str
-    prompt_text: str
-    video_id: str
+    audio_path: str           # clipped wav used for TTS voice clone
+    prompt_text: str          # text spoken in the clip
     start_ms: int
     end_ms: int
+    source_audio_path: str = ""   # original file the clip was cut from
+    video_id: str = ""            # legacy field, kept for compat
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> VoiceSample:
-        return cls(**data)
+        return cls(
+            audio_path=str(data["audio_path"]),
+            prompt_text=str(data["prompt_text"]),
+            start_ms=int(data.get("start_ms", 0)),
+            end_ms=int(data.get("end_ms", 0)),
+            source_audio_path=str(data.get("source_audio_path", "")),
+            video_id=str(data.get("video_id", "")),
+        )
 
 
 @dataclass(slots=True)

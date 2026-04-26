@@ -44,7 +44,10 @@ def write_json(path: Path, data: Any) -> None:
 def read_json(path: Path, default: Any | None = None) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError):
+        return default
 
 
 def sha256_text(text: str) -> str:

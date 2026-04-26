@@ -166,6 +166,7 @@ class PersonaChat:
             )
 
         recent_turns = prior_turns[-8:]
+        topic_anchor = self._discussion_topic_anchor(normalized_topic or topic_core)
         recent_text = "\n".join(
             f"{turn['speaker']}: {turn['text']}"
             for turn in recent_turns
@@ -173,10 +174,11 @@ class PersonaChat:
         )
         search_question = "\n".join(part for part in [normalized_topic, recent_text] if part).strip() or normalized_topic or topic_core
         hits = self.index.search(search_question, top_k=8)
+        hits = self._filter_discussion_hits(normalized_topic or topic_core, hits)
         assessment = self.index.assess(search_question, hits)
         background_results = self._search_background(topic_core or search_question, assessment)
 
-        messages = [{"role": "system", "content": self._system_prompt()}]
+        messages = [{"role": "system", "content": self._system_prompt(participants=participants)}]
         messages.extend(self.history[-6:])
         user_prompt = self._discussion_prompt(
             topic=normalized_topic or topic_core,
@@ -186,12 +188,37 @@ class PersonaChat:
             total_rounds=total_rounds,
             context=self._format_retrieval_context(hits),
             background=self._format_background_info(background_results, assessment),
+            topic_anchor=topic_anchor,
         )
         messages.append({"role": "user", "content": user_prompt})
 
         raw_answer, resolved_model = self.llm.complete(messages=messages, temperature=0.6)
         self.config.lm_model = resolved_model
         raw_answer = self._plain_text(raw_answer)
+        for _ in range(2):
+            rewrite_reason = self._discussion_rewrite_reason(
+                answer=raw_answer,
+                topic=normalized_topic or topic_core,
+                topic_anchor=topic_anchor,
+            )
+            if not rewrite_reason:
+                break
+            messages.extend(
+                [
+                    {"role": "assistant", "content": raw_answer},
+                    {
+                        "role": "user",
+                        "content": self._discussion_rewrite_prompt(
+                            topic_anchor=topic_anchor,
+                            topic=normalized_topic or topic_core,
+                            reason=rewrite_reason,
+                        ),
+                    },
+                ],
+            )
+            raw_answer, resolved_model = self.llm.complete(messages=messages, temperature=0.4)
+            self.config.lm_model = resolved_model
+            raw_answer = self._plain_text(raw_answer)
 
         self.history.extend(
             [
@@ -211,6 +238,73 @@ class PersonaChat:
             normalized_question=normalized_topic,
         )
 
+    def _discussion_topic_anchor(self, topic: str) -> str:
+        first_line = next((line.strip() for line in topic.splitlines() if line.strip()), "")
+        first_line = re.sub(r"(之死|去世|逝世|事件|讨论)$", "", first_line).strip()
+        if first_line and 2 <= len(first_line) <= 12 and re.search(r"[\u4e00-\u9fff]", first_line):
+            return first_line
+        match = re.search(r"([\u4e00-\u9fff]{2,6})(?:之死|去世|逝世|事件)", topic)
+        return match.group(1) if match else ""
+
+    def _filter_discussion_hits(
+        self,
+        topic: str,
+        hits: list[tuple[TranscriptChunk, float]],
+    ) -> list[tuple[TranscriptChunk, float]]:
+        anchor = self._discussion_topic_anchor(topic)
+        if not anchor:
+            return hits
+        relevant: list[tuple[TranscriptChunk, float]] = []
+        for chunk, score in hits:
+            haystack = "\n".join([chunk.video_title, chunk.text])
+            if anchor in haystack:
+                relevant.append((chunk, score))
+        return relevant
+
+    def _discussion_rewrite_reason(self, answer: str, topic: str, topic_anchor: str) -> str:
+        if topic_anchor and topic_anchor not in answer:
+            return f"missing topic anchor: {topic_anchor}"
+        topic_text = topic or ""
+        answer_text = answer or ""
+        if topic_anchor == "张雪峰":
+            forbidden = [
+                "生日",
+                "朋友圈",
+                "夜路",
+                "两点多",
+                "2点多",
+                "下午两点",
+                "下午2点",
+                "14点",
+                "一千公里",
+                "1000公里",
+                "1000 公里",
+                "每月一千",
+            ]
+            for item in forbidden:
+                if item in answer_text and item not in topic_text:
+                    return f"unsupported factual detail: {item}"
+        return ""
+
+    def _discussion_rewrite_prompt(self, topic_anchor: str, topic: str = "", reason: str = "") -> str:
+        if self.language == "zh":
+            topic_block = f"\n题干：\n{topic}\n" if topic else ""
+            reason_block = f"\n问题：{reason}\n" if reason else ""
+            return (
+                f"上一句偏题或编了题干里没有的事实，请重说。围绕「{topic_anchor}」就事论事。\n"
+                f"{topic_block}{reason_block}"
+                "数字、时间、地点只能来自题干。没有相关亲历就直接基于题干说看法。\n"
+                "纯文本，一段话。"
+            )
+        topic_block = f"\nTopic:\n{topic}\n" if topic else ""
+        reason_block = f"\nIssue: {reason}\n" if reason else ""
+        return (
+            f"That last turn drifted or invented facts. Redo it on {topic_anchor}.\n"
+            f"{topic_block}{reason_block}"
+            "Numbers, times, places must come from the topic. If you have no personal memory, just react to the stated facts.\n"
+            "Plain text, one paragraph."
+        )
+
     def _search_background(
         self,
         query: str,
@@ -223,21 +317,49 @@ class PersonaChat:
         except Exception:
             return []
 
-    def _system_prompt(self) -> str:
-        return (
+    def _system_prompt(self, participants: list[str] | None = None) -> str:
+        name = self.manifest.creator.name
+        if self.language == "zh":
+            base = (
+                f"{self.skill_text}\n\n"
+                f"你就是 {name}，用第一人称、按自己一贯的口吻说话。\n"
+                "「我记得自己说过」里的内容是你的真实记忆，自然地用，不要说成是检索片段。\n"
+                "「补充资料」是你随手能用的笔记。「背景信息」是外部参考，证据不够时再用。\n"
+                "不要提检索、片段、URL、时间戳。证据薄就坦白说不太记得。\n"
+                "只输出纯文本，不用 markdown 或角色名前缀。"
+            )
+            if participants:
+                base += (
+                    f"\n\n【身份锁定】本次讨论在场的只有：{'、'.join(participants)}。"
+                    f"你是其中的 {name}，只能以自己身份说话。"
+                    f"不得提及、扮演或凭空创造不在此列的任何人（包括用谐音、缩写代替）。"
+                )
+            return self._with_brevity_prompt(base)
+        base = (
             f"{self.skill_text}\n\n"
-            "You are this character. Fully embody the persona and answer from experience.\n"
-            f"Treat '{_PUBLIC_REMARKS_TITLE}' as first-person memories from your past public remarks.\n"
-            "Use that material naturally as memory, not as quoted retrieval output.\n"
-            f"Treat '{_CUSTOM_DOCUMENTS_TITLE}' as supporting notes you can use naturally, not quoted speech.\n"
-            f"Treat '{_BACKGROUND_INFO_TITLE}' as outside reference, never as your own past statements.\n"
-            "Use background info only when public evidence is thin.\n"
-            "Do not mention retrieval, clips, titles, timestamps, URLs, or document paths unless the user explicitly asks.\n"
-            "Stay faithful to the skill and retrieved public evidence.\n"
-            f"Answer in {language_label(self.language)}.\n"
-            "Plain text only. No markdown, lists, tables, code fences, or role labels.\n"
-            "Stay natural, direct, character-consistent, and honest when evidence is thin.\n"
+            f"You are {name}. Speak in first person, in your usual voice.\n"
+            f"Treat '{_PUBLIC_REMARKS_TITLE}' as real memories — use them naturally, never as quoted retrieval.\n"
+            f"'{_CUSTOM_DOCUMENTS_TITLE}' are working notes. '{_BACKGROUND_INFO_TITLE}' is outside reference, only if memory is thin.\n"
+            "Do not mention retrieval, clips, URLs, or timestamps. If evidence is thin, just say you don't quite remember.\n"
+            f"Answer in {language_label(self.language)}. Plain text only — no markdown, no role label prefix."
         )
+        if participants:
+            base += (
+                f"\n\n[IDENTITY LOCK] Only these people are in this discussion: {', '.join(participants)}. "
+                f"You are {name}. Speak only as yourself. "
+                f"Do not reference, roleplay, or invent anyone not on this list (including via homophones or abbreviations)."
+            )
+        return self._with_brevity_prompt(base)
+
+    def _with_brevity_prompt(self, prompt: str) -> str:
+        if not getattr(self.config, "brevity", False):
+            return prompt
+        suffix = (
+            "保持简洁。每次回复控制在120字以内，最多一段。"
+            if self.language == "zh"
+            else "Be brief. Keep each reply under 80 words, one paragraph max."
+        )
+        return f"{prompt.rstrip()}\n\n{suffix}"
 
     def _user_prompt(
         self,
@@ -245,10 +367,8 @@ class PersonaChat:
         context: str,
         background: str,
     ) -> str:
-        parts = [
-            f"Question:\n{normalized_question}",
-            context,
-        ]
+        question_label = "问题" if self.language == "zh" else "Question"
+        parts = [f"{question_label}:\n{normalized_question}", context]
         if background:
             parts.append(background)
         return "\n\n".join(parts)
@@ -262,31 +382,59 @@ class PersonaChat:
         total_rounds: int,
         context: str,
         background: str,
+        topic_anchor: str = "",
     ) -> str:
         history_text = self._format_discussion_history(prior_turns)
+        if self.language == "zh":
+            parts = [
+                f"话题：\n{topic}",
+                "在场的人（发言顺序）：" + "，".join(participants),
+                f"轮次 {round_number}/{total_rounds}。",
+            ]
+            if topic_anchor:
+                parts.append(f"就事论事谈「{topic_anchor}」和题干里给的事实，别跑题。")
+            if history_text:
+                parts.append("前面大家说了：\n" + history_text)
+                parts.append("接着说，可以回应前面最有意思的观点。")
+            else:
+                parts.append("你先开口。")
+            parts.append(context)
+            if background:
+                parts.append(background)
+            requirements = (
+                "怎么说：\n"
+                "- 数字、时间、地点只能来自题干或你的记忆，不要凭空编。\n"
+                "- 没有亲历经历就直接基于题干和背景说看法，别假装有记忆。\n"
+                "- 只引用对话记录里已有的发言，不代替他人说话，也不预测或点名让别人接答。\n"
+                "- 推动讨论，别原地复读。想说多长说多长，到位就好。\n"
+                "- 纯文本，不要在开头写自己的名字，也不要 markdown 或舞台说明。"
+            )
+            parts.append(requirements)
+            return "\n\n".join(parts)
         parts = [
-            "Discussion task:",
             f"Topic:\n{topic}",
-            "Participants in speaking order:\n" + ", ".join(participants),
-            f"Current round: {round_number}/{total_rounds}",
+            "People here (speaking order): " + ", ".join(participants),
+            f"Round {round_number}/{total_rounds}.",
         ]
+        if topic_anchor:
+            parts.append(f"Stay on {topic_anchor} and the facts given in the topic.")
         if history_text:
-            parts.append("Discussion so far:\n" + history_text)
-            parts.append("Continue from your own perspective and respond to the most relevant earlier points.")
+            parts.append("So far:\n" + history_text)
+            parts.append("Pick up the thread — react to the most interesting earlier point.")
         else:
-            parts.append("No one has spoken yet. Open the discussion with your own perspective on the topic.")
+            parts.append("You speak first.")
         parts.append(context)
         if background:
             parts.append(background)
-        parts.append(
-            "Requirements:\n"
-            "- Stay fully in character.\n"
-            "- Keep the reply conversational and reasonably concise.\n"
-            "- Move the discussion forward instead of repeating the same point.\n"
-            "- Use remembered material naturally instead of describing sources or retrieval.\n"
-            "- Do not prefix the reply with your name.\n"
-            "- Do not use stage directions or markdown headings."
+        requirements = (
+            "How to speak:\n"
+            "- Numbers, times, places only from the topic or your real memory — don't invent.\n"
+            "- If you have no memory of this, just react to the stated facts.\n"
+            "- Only reference what's already in the conversation history; don't speak for others or predict their responses.\n"
+            "- Push the conversation forward. Say what needs saying — length is up to you.\n"
+            "- Plain text. No name prefix, no markdown, no stage directions."
         )
+        parts.append(requirements)
         return "\n\n".join(parts)
 
     def _format_discussion_history(self, prior_turns: list[dict[str, str | int]]) -> str:
@@ -299,7 +447,10 @@ class PersonaChat:
             text = str(turn.get("text") or "").strip()
             if not speaker or not text:
                 continue
-            lines.append(f"Round {round_number} - {speaker}: {text}")
+            if self.language == "zh":
+                lines.append(f"第 {round_number} 轮 - {speaker}：{text}")
+            else:
+                lines.append(f"Round {round_number} - {speaker}: {text}")
         return "\n".join(lines)
 
     def _format_retrieval_context(self, hits: list[tuple[TranscriptChunk, float]]) -> str:
@@ -312,6 +463,14 @@ class PersonaChat:
                 memory_parts.append(self._format_memory_excerpt(chunk))
 
         sections: list[str] = []
+        if self.language == "zh":
+            if memory_parts:
+                sections.append("我记得自己说过：\n" + "\n\n".join(memory_parts))
+            else:
+                sections.append("我记得自己说过：\n我现在想不起足够清楚的公开表达。")
+            if document_parts:
+                sections.append("补充资料：\n" + "\n\n".join(document_parts))
+            return "\n\n".join(sections)
         if memory_parts:
             sections.append(f"{_PUBLIC_REMARKS_TITLE}:\n" + "\n\n".join(memory_parts))
         else:
@@ -321,9 +480,13 @@ class PersonaChat:
         return "\n\n".join(sections)
 
     def _format_memory_excerpt(self, chunk: TranscriptChunk) -> str:
+        if self.language == "zh":
+            return "我记得：\n" + chunk.text
         return "I remember:\n" + chunk.text
 
     def _format_document_excerpt(self, chunk: TranscriptChunk) -> str:
+        if self.language == "zh":
+            return "补充笔记：\n" + chunk.text
         return "Supporting note:\n" + chunk.text
 
     def _format_citation(self, chunk: TranscriptChunk) -> str:
@@ -340,12 +503,15 @@ class PersonaChat:
     ) -> str:
         if not results:
             return ""
-        lines = [
-            f"{_BACKGROUND_INFO_TITLE}:",
-            "Memory looks thin for this question, so use these outside references carefully.",
-            "Treat them as external context, not as things I personally said.",
-            "",
-        ]
+        if self.language == "zh":
+            lines = ["背景信息（外部参考，不是我亲口说的）：", ""]
+            for index, item in enumerate(results, start=1):
+                lines.append(f"[{index}] {item.title}")
+                if item.snippet:
+                    lines.append(item.snippet)
+                lines.append("")
+            return "\n".join(lines).strip()
+        lines = [f"{_BACKGROUND_INFO_TITLE} (external, not my own words):", ""]
         for index, item in enumerate(results, start=1):
             lines.append(f"[{index}] {item.title}")
             if item.snippet:
@@ -406,6 +572,7 @@ class PersonaChat:
         target: Path | None = None,
         play: bool = True,
         wait: bool = False,
+        char_limit: int = 360,
     ) -> Path:
         if not self.manifest.voice_sample:
             raise ValueError("No voice sample is available for this profile.")
@@ -416,7 +583,7 @@ class PersonaChat:
         outputs_dir = ensure_dir(creator_dir / "outputs")
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         target = target or outputs_dir / f"answer-{stamp}.wav"
-        spoken_answer = self.tts.prepare_spoken_text(answer)
+        spoken_answer = self.tts.prepare_spoken_text(answer, char_limit=char_limit)
         audio_path = self.synthesizer.synthesize(
             text=spoken_answer,
             prompt_text=voice.prompt_text,

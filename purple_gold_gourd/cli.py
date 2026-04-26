@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import sys
 from dataclasses import replace
 from datetime import datetime
@@ -9,17 +11,23 @@ from pathlib import Path
 from .chat.discussion import (
     DiscussionPlaybackQueue,
     DiscussionParticipant,
+    DiscussionSpeechSynthesizer,
     create_discussion_record_dir,
     prepare_discussion_turn,
+    prepare_host_turn,
     save_discussion_snapshot,
     stop_discussion_audio,
 )
 from .chat.persona import PersonaChat
 from .config import AppConfig
+from .media.video import render_discussion_video
 from .pipeline import BuildPipeline
 from .plugins.tts.shared import clip_audio
 from .schema import VoiceSample
 from .utils import ensure_dir, write_json
+
+
+DEFAULT_HOST_VOICE_PROMPT_TEXT = "欢迎来到紫金葫芦，我们开始今天的讨论。"
 
 
 def build_chat_parser() -> argparse.ArgumentParser:
@@ -30,7 +38,7 @@ def build_chat_parser() -> argparse.ArgumentParser:
     parser.add_argument("query", nargs="?", help="Creator name, id, handle, or homepage URL.")
     parser.add_argument("--platform", choices=["auto", "youtube", "bilibili"], default="auto")
     parser.add_argument("--top", type=int, default=10, help="How many top videos to process.")
-    parser.add_argument("--scan-limit", type=int, default=30, help="How many videos to inspect before ranking.")
+    parser.add_argument("--scan-limit", type=int, default=30, help="How many creator videos to list before selecting.")
     parser.add_argument(
         "--series",
         nargs="+",
@@ -43,9 +51,16 @@ def build_chat_parser() -> argparse.ArgumentParser:
         default=[],
         help="Local audio/video files to import into this character before transcription and skill refresh.",
     )
+    parser.add_argument(
+        "--include-title-keyword",
+        action="append",
+        default=[],
+        help="Always include creator videos whose title contains this keyword. Can be repeated.",
+    )
     parser.add_argument("--rebuild", action="store_true", help="Ignore cached profile and rebuild.")
     parser.add_argument("--build-only", action="store_true", help="Prepare the persona but do not open chat.")
     parser.add_argument("--speak", action="store_true", help="Start chat with TTS reply synthesis enabled.")
+    parser.add_argument("--brevity", action="store_true", help="Ask the persona to keep replies brief.")
     return parser
 
 
@@ -59,15 +74,40 @@ def build_discuss_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rounds", type=int, default=3, help="How many full rounds to run.")
     parser.add_argument("--platform", choices=["auto", "youtube", "bilibili"], default="auto")
     parser.add_argument("--top", type=int, default=10, help="How many top videos to process for each character.")
-    parser.add_argument("--scan-limit", type=int, default=30, help="How many videos to inspect before ranking.")
+    parser.add_argument("--scan-limit", type=int, default=30, help="How many creator videos to list before selecting.")
     parser.add_argument(
         "--series",
         nargs="+",
         default=[],
         help="1-based ranked video numbers to use for RAG, for example: --series 1 3 8 or --series 1,3,8",
     )
+    parser.add_argument(
+        "--include-title-keyword",
+        action="append",
+        default=[],
+        help="Always include creator videos whose title contains this keyword. Can be repeated.",
+    )
     parser.add_argument("--rebuild", action="store_true", help="Ignore cached profiles and rebuild.")
     parser.add_argument("--speak", action="store_true", help="Start the discussion with speech playback enabled.")
+    parser.add_argument("--brevity", action="store_true", help="Ask every discussion participant and host to be brief.")
+    parser.add_argument(
+        "--to-video",
+        action="store_true",
+        help="Render the discussion to an MP4 with speech, avatar panels, waveform, and timed subtitles. Implies --speak.",
+    )
+    return parser
+
+
+def build_set_voice_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="purple-gold-gourd set-voice",
+        description="Set the TTS voice reference for a creator from a wav/video file + timestamp range.",
+    )
+    parser.add_argument("query", help="Creator name, id, or URL.")
+    parser.add_argument("audio", help="Path to the source audio or video file.")
+    parser.add_argument("timestamps", help="Time range as start-end, e.g. 01:01-01:16 or 1:30:00-1:35:00")
+    parser.add_argument("--text", default="", help="Spoken text in the clip (skips auto-transcription).")
+    parser.add_argument("--platform", choices=["auto", "youtube", "bilibili"], default="auto")
     return parser
 
 
@@ -78,6 +118,10 @@ def main(argv: list[str] | None = None) -> None:
         args = build_discuss_parser().parse_args(raw_args[1:])
         _run_discuss(args)
         return
+    if raw_args and raw_args[0] == "set-voice":
+        args = build_set_voice_parser().parse_args(raw_args[1:])
+        _run_set_voice(args)
+        return
     args = build_chat_parser().parse_args(raw_args)
     _run_chat(args)
 
@@ -86,6 +130,7 @@ def _run_chat(args: argparse.Namespace) -> None:
     query = args.query or input("Creator name/id/url: ").strip()
     selected_series_numbers = _parse_series_numbers(args.series)
     config = AppConfig.load()
+    config.brevity = args.brevity
     pipeline = BuildPipeline(config)
 
     print(f"Resolving and building persona for: {query}")
@@ -95,6 +140,7 @@ def _run_chat(args: argparse.Namespace) -> None:
         top_n=args.top,
         scan_limit=args.scan_limit,
         series_numbers=selected_series_numbers,
+        include_title_keywords=args.include_title_keyword,
         local_media_paths=args.media,
         rebuild=args.rebuild,
     )
@@ -159,6 +205,7 @@ def _run_chat(args: argparse.Namespace) -> None:
                 top_n=args.top,
                 scan_limit=args.scan_limit,
                 series_numbers=selected_series_numbers,
+                include_title_keywords=args.include_title_keyword,
                 local_media_paths=args.media,
                 rebuild=True,
             )
@@ -187,11 +234,63 @@ def _run_chat(args: argparse.Namespace) -> None:
                 print(f"Audio synthesis failed: {exc}")
 
 
+def _run_set_voice(args: argparse.Namespace) -> None:
+    audio_path = Path(args.audio).expanduser().resolve()
+    if not audio_path.exists():
+        sys.exit(f"File not found: {audio_path}")
+    try:
+        start_ms, end_ms = _parse_time_range(args.timestamps)
+    except ValueError as exc:
+        sys.exit(f"Bad time range: {exc}")
+    if end_ms <= start_ms:
+        sys.exit("End time must be after start time.")
+
+    config = AppConfig.load()
+    pipeline = BuildPipeline(config)
+    print(f"Loading persona for: {args.query}")
+    manifest = pipeline.build(query=args.query, platform=args.platform)
+
+    voice_dir = ensure_dir(Path(manifest.creator_dir) / "voice")
+    clip_name = f"manual-{start_ms}-{end_ms}-voice-prompt.wav"
+    clip_path = voice_dir / clip_name
+
+    print(f"Extracting {args.timestamps} from {audio_path.name} ...")
+    try:
+        clip_audio(config.ffmpeg_path, audio_path, clip_path, start_ms, end_ms)
+    except Exception as exc:
+        sys.exit(f"Audio extraction failed: {exc}")
+
+    prompt_text = args.text.strip()
+    if not prompt_text:
+        print("Transcribing clip ...")
+        try:
+            prompt_text = pipeline.transcriber.transcribe_text(clip_path).strip()
+        except Exception:
+            pass
+    if not prompt_text:
+        sys.exit("Could not transcribe clip. Pass --text with the spoken content.")
+
+    new_sample = VoiceSample(
+        audio_path=str(clip_path),
+        prompt_text=prompt_text,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        source_audio_path=str(audio_path),
+    )
+    updated = replace(manifest, voice_sample=new_sample)
+    write_json(Path(manifest.creator_dir) / "manifest.json", updated.to_dict())
+    print(f"Voice set for {manifest.creator.name}")
+    print(f"  Source : {audio_path}")
+    print(f"  Clip   : {clip_path}")
+    print(f"  Text   : {prompt_text}")
+
+
 def _run_discuss(args: argparse.Namespace) -> None:
     if args.rounds <= 0:
         raise ValueError("Discussion rounds must be positive.")
 
     config = AppConfig.load()
+    config.brevity = args.brevity
     pipeline = BuildPipeline(config)
     selected_series_numbers = _parse_series_numbers(args.series)
     participants = _build_discussion_participants(
@@ -201,12 +300,21 @@ def _run_discuss(args: argparse.Namespace) -> None:
         pipeline=pipeline,
         selected_series_numbers=selected_series_numbers,
     )
+    host_voice_sample = _ensure_host_voice_sample(config) if args.speak or args.to_video else None
     record_dir = create_discussion_record_dir(config, args.topic)
     audio_dir = ensure_dir(record_dir / "audio")
     started_at = datetime.now().isoformat(timespec="seconds")
     turns: list = []
-    speak_enabled = args.speak and any(participant.voice_available for participant in participants)
+    if args.to_video:
+        missing_voices = [participant.name for participant in participants if not participant.voice_available]
+        if missing_voices:
+            names = ", ".join(missing_voices)
+            raise ValueError(f"--to-video requires a usable voice prompt for every participant. Missing: {names}")
+    speak_enabled = (args.speak or args.to_video) and any(participant.voice_available for participant in participants)
+    live_playback_enabled = args.speak and not args.to_video
+    auto_continue_enabled = args.to_video or not sys.stdin.isatty()
     playback_queue = DiscussionPlaybackQueue()
+    speech_synthesizer = DiscussionSpeechSynthesizer()
 
     print(f"Discussion topic: {args.topic}")
     print("Participants: " + " -> ".join(participant.name for participant in participants))
@@ -215,8 +323,14 @@ def _run_discuss(args: argparse.Namespace) -> None:
     for participant in participants:
         status = "available" if participant.voice_available else "not available"
         print(f"Voice for {participant.name}: {status}")
+    if args.speak or args.to_video:
+        status = "available" if host_voice_sample is not None else "not available"
+        suffix = f" ({host_voice_sample.audio_path})" if host_voice_sample is not None else ""
+        print(f"Voice for 主持人: {status}{suffix}")
     if args.speak and not speak_enabled:
         print("Speak mode requested, but no participant currently has a usable voice prompt.")
+    if args.to_video:
+        print("Video mode: speech synthesis enabled; live playback skipped while the MP4 is rendered.")
 
     save_discussion_snapshot(
         record_dir=record_dir,
@@ -228,11 +342,14 @@ def _run_discuss(args: argparse.Namespace) -> None:
     )
 
     try:
-        should_continue, speak_enabled = _discussion_control_prompt(
-            participants=participants,
-            speak_enabled=speak_enabled,
-            prompt_text="Press Enter to start, or use /speak on, /speak off, /help, /exit: ",
-        )
+        if auto_continue_enabled:
+            should_continue = True
+        else:
+            should_continue, speak_enabled = _discussion_control_prompt(
+                participants=participants,
+                speak_enabled=speak_enabled,
+                prompt_text="Press Enter to start, or use /speak on, /speak off, /help, /exit: ",
+            )
         if not should_continue:
             save_discussion_snapshot(
                 record_dir=record_dir,
@@ -246,8 +363,44 @@ def _run_discuss(args: argparse.Namespace) -> None:
             print(f"Discussion exited. Partial record saved to: {record_dir}")
             return
 
+        host_tts_participant = participants[0] if participants else None
+
         for round_number in range(1, args.rounds + 1):
             print(f"\n=== Round {round_number}/{args.rounds} ===")
+
+            # Host intro turn
+            host_turn = prepare_host_turn(
+                topic=args.topic,
+                participants=participants,
+                prior_turns=turns,
+                round_number=round_number,
+                total_rounds=args.rounds,
+            )
+            host_job = None
+            if speak_enabled and host_tts_participant and host_voice_sample:
+                host_job = speech_synthesizer.submit(
+                    participant=host_tts_participant,
+                    turn=host_turn,
+                    spoken_answer=host_turn.spoken_text,
+                    audio_dir=audio_dir,
+                    voice_sample=host_voice_sample,
+                )
+                if live_playback_enabled:
+                    playback_queue.enqueue_future(host_tts_participant, host_job.future)
+            turns.append(host_turn)
+            save_discussion_snapshot(
+                record_dir=record_dir,
+                topic=args.topic,
+                requested_rounds=args.rounds,
+                participants=participants,
+                turns=turns,
+                started_at=started_at,
+            )
+            print(f"\n{host_turn.speaker}: {host_turn.text}")
+            if host_job is not None:
+                status = "synthesizing" if not host_job.future.done() else "ready"
+                print(f"Host audio: {host_turn.audio_path} ({status})")
+
             for participant in participants:
                 prepared = prepare_discussion_turn(
                     participant=participant,
@@ -256,10 +409,19 @@ def _run_discuss(args: argparse.Namespace) -> None:
                     prior_turns=turns,
                     round_number=round_number,
                     total_rounds=args.rounds,
-                    speak_enabled=speak_enabled,
-                    audio_dir=audio_dir,
                 )
                 turn = prepared.record
+                job = None
+                if speak_enabled and participant.voice_available:
+                    job = speech_synthesizer.submit(
+                        participant=participant,
+                        turn=turn,
+                        spoken_answer=prepared.spoken_answer,
+                        audio_dir=audio_dir,
+                    )
+                    prepared.audio_file = job.audio_file
+                    if live_playback_enabled:
+                        playback_queue.enqueue_future(participant, job.future)
                 turns.append(turn)
                 save_discussion_snapshot(
                     record_dir=record_dir,
@@ -274,19 +436,22 @@ def _run_discuss(args: argparse.Namespace) -> None:
                     print("Refs: " + " | ".join(turn.citations))
                 if speak_enabled:
                     if prepared.audio_file is not None:
-                        playback_queue.enqueue(participant, prepared.audio_file)
-                        print(f"Audio: {turn.audio_path}")
+                        status = "synthesizing" if not job.future.done() else "ready"
+                        print(f"Audio: {turn.audio_path} ({status})")
                     elif not participant.voice_available:
                         print("Audio: skipped because this character has no voice prompt.")
-            if speak_enabled:
+            if speak_enabled and live_playback_enabled:
                 playback_queue.wait()
             if round_number >= args.rounds:
                 break
-            should_continue, speak_enabled = _discussion_control_prompt(
-                participants=participants,
-                speak_enabled=speak_enabled,
-                prompt_text="Press Enter for the next round, or use /speak on, /speak off, /help, /exit: ",
-            )
+            if auto_continue_enabled:
+                should_continue = True
+            else:
+                should_continue, speak_enabled = _discussion_control_prompt(
+                    participants=participants,
+                    speak_enabled=speak_enabled,
+                    prompt_text="Press Enter for the next round, or use /speak on, /speak off, /help, /exit: ",
+                )
             if not should_continue:
                 finished_at = datetime.now().isoformat(timespec="seconds")
                 save_discussion_snapshot(
@@ -301,6 +466,9 @@ def _run_discuss(args: argparse.Namespace) -> None:
                 print(f"Discussion exited. Partial record saved to: {record_dir}")
                 return
 
+        if speech_synthesizer.has_jobs:
+            print("Waiting for speech synthesis ...")
+            speech_synthesizer.wait_all()
         finished_at = datetime.now().isoformat(timespec="seconds")
         save_discussion_snapshot(
             record_dir=record_dir,
@@ -311,9 +479,21 @@ def _run_discuss(args: argparse.Namespace) -> None:
             started_at=started_at,
             finished_at=finished_at,
         )
+        if args.to_video:
+            print("Rendering discussion video ...")
+            video = render_discussion_video(
+                ffmpeg_path=config.ffmpeg_path,
+                record_dir=record_dir,
+                topic=args.topic,
+                participants=participants,
+                turns=turns,
+            )
+            print(f"Video: {video.video_path}")
+            print(f"Subtitles: {video.subtitles_path}")
         print(f"\nDiscussion finished. Record saved to: {record_dir}")
     finally:
         stop_discussion_audio(participants)
+        speech_synthesizer.shutdown(wait=False, cancel_futures=True)
         playback_queue.shutdown(wait=False, cancel_futures=True)
 
 
@@ -333,6 +513,8 @@ def _build_discussion_participants(
             top_n=args.top,
             scan_limit=args.scan_limit,
             series_numbers=selected_series_numbers,
+            include_title_keywords=args.include_title_keyword,
+            limit_to_target_videos=True,
             rebuild=args.rebuild,
         )
         transcripts = pipeline.load_transcripts(manifest)
@@ -345,6 +527,58 @@ def _build_discussion_participants(
             ),
         )
     return participants
+
+
+def _ensure_host_voice_sample(config: AppConfig) -> VoiceSample:
+    audio_path = _resolve_config_path(config.host_voice_audio_path, config.workspace_dir)
+    source_audio_path = _resolve_config_path(config.host_voice_source_audio_path, config.workspace_dir)
+    metadata_path = audio_path.with_suffix(".json")
+    prompt_text = config.host_voice_prompt_text.strip() or DEFAULT_HOST_VOICE_PROMPT_TEXT
+
+    if not source_audio_path.exists():
+        raise ValueError(
+            "Host voice reference source is missing. "
+            f"Expected qwen3 TTS sample at: {source_audio_path}"
+        )
+    ensure_dir(audio_path.parent)
+    needs_copy = True
+    if audio_path.exists() and metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            needs_copy = (
+                str(metadata.get("source_audio_path") or "") != str(source_audio_path)
+                or str(metadata.get("generated_by") or "") != "qwen3-tts-sample"
+            )
+        except Exception:
+            needs_copy = True
+    if needs_copy:
+        shutil.copy2(source_audio_path, audio_path)
+        cache_path = audio_path.with_name(audio_path.stem + "-profile.pkl")
+        if cache_path.exists():
+            cache_path.unlink()
+    write_json(
+        metadata_path,
+        {
+            "audio_path": str(audio_path),
+            "prompt_text": prompt_text,
+            "source_audio_path": str(source_audio_path),
+            "generated_by": "qwen3-tts-sample",
+        },
+    )
+    return VoiceSample(
+        audio_path=str(audio_path),
+        prompt_text=prompt_text,
+        start_ms=0,
+        end_ms=0,
+        source_audio_path=str(source_audio_path),
+    )
+
+
+def _resolve_config_path(raw_path: str | Path, base_dir: str | Path) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = Path(base_dir) / path
+    return path.resolve()
 
 
 def _discussion_control_prompt(
@@ -459,9 +693,9 @@ def _calibrate_voice(
     new_sample = VoiceSample(
         audio_path=str(clip_path),
         prompt_text=prompt_text,
-        video_id="calibrated",
         start_ms=start_ms,
         end_ms=end_ms,
+        source_audio_path=str(audio_path),
     )
 
     updated_manifest = replace(manifest, voice_sample=new_sample)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -20,16 +21,14 @@ def candidate_models(client: OpenAI, preferred_model: str) -> list[str]:
         ordered.append(model_id)
 
     add(preferred_model)
-    try:
-        response = client.models.list()
-        for item in response.data:
-            model_id = str(getattr(item, "id", "") or "")
-            if "embed" in model_id.lower():
-                continue
-            add(model_id)
-    except Exception:
-        pass
+    for model_id in _backup_models():
+        add(model_id)
     return ordered
+
+
+def _backup_models() -> list[str]:
+    raw = os.getenv("OPENAI_MODEL_BACKUPS") or os.getenv("OPENAI_MODEL_BACKUP") or "gemma-4-26b-a4b-it"
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def strip_reasoning_blocks(text: str) -> str:
@@ -50,10 +49,12 @@ class ManagedLLM:
         max_context_tokens: int = 0,
         max_completion_tokens: int = 0,
     ) -> None:
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        timeout = _parse_timeout(os.getenv("OPENAI_TIMEOUT", ""))
+        self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
         self.preferred_model = preferred_model
         self.max_context_tokens = max(max_context_tokens, 0)
         self.max_completion_tokens = max(max_completion_tokens, 0)
+        self.strict_model = os.getenv("OPENAI_STRICT_MODEL", "").strip().lower() in {"1", "true", "yes", "on"}
 
     def complete(
         self,
@@ -63,7 +64,8 @@ class ManagedLLM:
     ) -> tuple[str, str]:
         last_error: Exception | None = None
         effective_max_tokens = self.max_completion_tokens if max_tokens is None else max(max_tokens, 0)
-        for model_id in candidate_models(self.client, self.preferred_model):
+        model_ids = [self.preferred_model] if self.strict_model else candidate_models(self.client, self.preferred_model)
+        for model_id in model_ids:
             try:
                 request: dict[str, Any] = {
                     "model": model_id,
@@ -79,7 +81,7 @@ class ManagedLLM:
             except Exception as exc:
                 last_error = exc
                 message = str(exc).lower()
-                if "model is unloaded" in message or "currently not loaded" in message:
+                if not self.strict_model and ("model is unloaded" in message or "currently not loaded" in message):
                     continue
                 raise
         if last_error is not None:
@@ -112,6 +114,14 @@ def complete_with_model_fallback(
     )
     llm.client = client
     return llm.complete(messages=messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def _parse_timeout(raw: str) -> float:
+    try:
+        value = float(str(raw or "").strip())
+    except Exception:
+        return 180.0
+    return value if value > 0 else 180.0
 
 
 def _message_text(message: Any) -> str:

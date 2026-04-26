@@ -6,8 +6,6 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import requests
-
 from .utils import ensure_dir
 
 
@@ -29,6 +27,10 @@ class AppConfig:
     web_search_enabled: bool = True
     web_search_max_results: int = 4
     web_search_timeout_s: float = 8.0
+    brevity: bool = False
+    host_voice_audio_path: str = ""
+    host_voice_source_audio_path: str = ""
+    host_voice_prompt_text: str = ""
 
     @classmethod
     def load(cls, workspace_dir: str | Path | None = None) -> AppConfig:
@@ -70,9 +72,14 @@ class AppConfig:
             os.getenv("PURPLE_GOLD_GOURD_TTS_PLUGIN")
             or "qwen3"
         ).strip().lower() or "qwen3"
-        lm_base_url = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
-        lm_api_key = os.getenv("OPENAI_API_KEY", "lm-studio")
-        desired_model = os.getenv("OPENAI_MODEL", "qwen3-4b")
+        lm_base_url = os.getenv("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+        lm_api_key = (
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+            or ""
+        )
+        desired_model = os.getenv("OPENAI_MODEL", "gemma-4-31b-it")
         lm_model = _resolve_lm_model(lm_base_url, lm_api_key, desired_model)
         return cls(
             workspace_dir=root,
@@ -114,8 +121,11 @@ class AppConfig:
                 "qwen3_tts_dtype": os.getenv("QWEN3_TTS_DTYPE", qwen3_tts_dtype),
                 "qwen3_tts_attn_implementation": os.getenv("QWEN3_TTS_ATTN_IMPLEMENTATION", ""),
                 "qwen3_tts_chunk_chars": os.getenv("QWEN3_TTS_CHUNK_CHARS", "160"),
-                "qwen3_tts_do_sample": os.getenv("QWEN3_TTS_DO_SAMPLE", "true"),
-                "qwen3_tts_max_new_tokens": os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", ""),
+                "qwen3_tts_do_sample": os.getenv("QWEN3_TTS_DO_SAMPLE", "false"),
+                "qwen3_tts_max_new_tokens": os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", "420"),
+                "qwen3_tts_adaptive_max_new_tokens": os.getenv("QWEN3_TTS_ADAPTIVE_MAX_NEW_TOKENS", "true"),
+                "qwen3_tts_quantization": os.getenv("QWEN3_TTS_QUANTIZATION", "auto"),
+                "qwen3_tts_x_vector_only": os.getenv("QWEN3_TTS_X_VECTOR_ONLY", "true"),
             },
             ffmpeg_path=os.getenv("FFMPEG_PATH", shutil.which("ffmpeg") or "ffmpeg"),
             web_search_enabled=_parse_bool(os.getenv("PURPLE_GOLD_GOURD_WEB_SEARCH", "true"), True),
@@ -127,6 +137,15 @@ class AppConfig:
                 os.getenv("PURPLE_GOLD_GOURD_WEB_SEARCH_TIMEOUT_S", "8"),
                 8.0,
             ),
+            host_voice_audio_path=os.getenv(
+                "PURPLE_GOLD_GOURD_HOST_VOICE_AUDIO",
+                str(data_dir / "host" / "voice" / "qwen3-host-voice.wav"),
+            ),
+            host_voice_source_audio_path=os.getenv(
+                "PURPLE_GOLD_GOURD_HOST_VOICE_SOURCE_AUDIO",
+                str(data_dir / "run-logs" / "tts-smoke.wav"),
+            ),
+            host_voice_prompt_text=os.getenv("PURPLE_GOLD_GOURD_HOST_VOICE_TEXT", ""),
         )
 
     def stt_setting(self, key: str, default: str | None = None) -> str:
@@ -177,30 +196,6 @@ class AppConfig:
 
 
 def _resolve_lm_model(base_url: str, api_key: str, desired_model: str) -> str:
-    try:
-        response = requests.get(
-            f"{base_url.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=5,
-        )
-        response.raise_for_status()
-        data = response.json().get("data") or []
-        model_ids = [str(item.get("id") or "") for item in data if item.get("id")]
-        if not model_ids:
-            return desired_model
-        if desired_model in model_ids:
-            return desired_model
-        desired_lower = desired_model.lower()
-        desired_compact = desired_lower.replace(".", "-")
-        for model_id in model_ids:
-            lowered = model_id.lower()
-            if desired_lower in lowered or desired_compact in lowered:
-                return model_id
-        for model_id in model_ids:
-            if "embed" not in model_id.lower():
-                return model_id
-    except Exception:
-        return desired_model
     return desired_model
 
 
